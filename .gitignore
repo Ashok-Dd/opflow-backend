@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+# Firebase server key (service account)
+firebase-service-account*.json
+*firebase-adminsdk*.json
+
+# Build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.uploads/
