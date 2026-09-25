@@ -338,7 +338,24 @@ export class JobsService implements OnApplicationShutdown {
     const outbox = await this.dbs.sys(sql`delete from outbox where done_at < now() - interval '14 days'`);
     const setup = await this.dbs.sys(sql`delete from admin_setup_tokens where expires_at < now() - interval '7 days'`);
     const tokens = await this.tokens.purge();
-    return { idempotencyKeys: Number(keys.numAffectedRows ?? 0), outbox: Number(outbox.numAffectedRows ?? 0), setupLinks: Number(setup.numAffectedRows ?? 0), refreshTokens: tokens };
+    // Rows that grow with every patient, kept only as long as they are useful:
+    // messages 90 days (the app shows the latest 50), live-line events 30 days, login codes 1 day, and the
+    // phone records made at each login once they have no push token and no login for 60 days.
+    const messages = await this.dbs.sys(sql`delete from notifications where created_at < now() - interval '90 days'`);
+    const events = await this.dbs.sys(sql`delete from queue_events where at < now() - interval '31 days'`);
+    const codes = await this.dbs.sys(sql`delete from phone_otps where created_at < now() - interval '1 day'`);
+    const devices = await this.dbs.sys(sql`delete from devices d where d.fcm_token is null and d.last_seen_at < now() - interval '60 days'
+                                              and not exists (select 1 from refresh_tokens r where r.device_id = d.id and r.revoked_at is null)`);
+    return {
+      idempotencyKeys: Number(keys.numAffectedRows ?? 0),
+      outbox: Number(outbox.numAffectedRows ?? 0),
+      setupLinks: Number(setup.numAffectedRows ?? 0),
+      refreshTokens: tokens,
+      messages: Number(messages.numAffectedRows ?? 0),
+      lineEvents: Number(events.numAffectedRows ?? 0),
+      loginCodes: Number(codes.numAffectedRows ?? 0),
+      devices: Number(devices.numAffectedRows ?? 0),
+    };
   }
 
   /** Deleted accounts: anything left that could identify them (devices, notifications) after 30 days. */
