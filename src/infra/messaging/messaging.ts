@@ -88,6 +88,8 @@ export class LogOtp implements OtpSender {
 
 // ── Firebase Cloud Messaging (HTTP v1) ───────────────────────────────────────────────────────────────
 
+const fcmLog = new Logger('Push');
+
 export class FcmPush implements PushSender {
   private token?: { value: string; exp: number };
 
@@ -138,11 +140,13 @@ export class FcmPush implements PushSender {
         signal: AbortSignal.timeout(10_000),
       });
       if (res.ok) sent++;
-      else if (res.status === 404 || res.status === 400) {
-        const text = await res.text();
-        if (/UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/.test(text)) deadTokens.push(token);
-      } else if (res.status >= 500 || res.status === 429) {
+      else if (res.status >= 500 || res.status === 429) {
         throw new Error(`FCM ${res.status}`); // retried by the outbox
+      } else {
+        const text = await res.text();
+        if ((res.status === 404 || res.status === 400) && /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/.test(text)) deadTokens.push(token);
+        // Never silent: a wrong key or project (403), a bad message… shows in the logs.
+        else fcmLog.warn(`Push not sent (FCM ${res.status}): ${text.slice(0, 300)}`);
       }
     }
     return { sent, deadTokens };
