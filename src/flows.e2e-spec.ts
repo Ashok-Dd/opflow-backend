@@ -391,6 +391,41 @@ run('OPflow end to end', () => {
     expect(v.body.booking.status).toBe('confirmed');
   });
 
+  it('paid but the phone never confirmed (Checkout said failed, signal lost): "check" confirms it, told once', async () => {
+    const p = await newPatient(62);
+    const windows = await bookableWindows();
+    const h = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', randomUUID()).send({ windowId: windows[windows.length - 2]!.id }).expect(201);
+    const bookingId = h.body.booking.id as string;
+    // Before paying: not paid, still waiting for payment.
+    const before = await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
+    expect(before.body).toMatchObject({ status: 'pending_payment', paid: false });
+    // The money is taken at Razorpay, but the app never calls verify.
+    await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    const after = await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
+    expect(after.body).toMatchObject({ status: 'confirmed', paid: true });
+    expect(after.body.booking.token).toBeGreaterThan(0);
+    // Asking again changes nothing; the patient is told exactly once.
+    await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
+    for (let i = 0; i < 3; i++) await jobs.relay();
+    const told = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where booking_id = ${bookingId} and title = 'Booking confirmed'`);
+    expect(told.rows[0]!.n).toBe(1);
+    // Another patient cannot ask about this booking.
+    const other = await newPatient(63);
+    await api().post(`/v1/payments/${bookingId}/check`).set(bearer(other.token)).expect(404);
+  });
+
+  it('messages page by page; the regular check asks only for new ones', async () => {
+    const p = s.patients[0]!;
+    const first = await api().get('/v1/notifications').set(bearer(p.token)).query({ limit: 1 }).expect(200);
+    expect(first.body.items).toHaveLength(1);
+    const newest = first.body.items[0].createdAt as string;
+    const none = await api().get('/v1/notifications').set(bearer(p.token)).query({ after: newest }).expect(200);
+    expect(none.body.items).toHaveLength(0);
+    expect(typeof none.body.unread).toBe('number');
+    const older = await api().get('/v1/notifications').set(bearer(p.token)).query({ after: '2020-01-01T00:00:00Z' }).expect(200);
+    expect(older.body.items.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('if Razorpay is down, no place is kept and no money is taken', async () => {
     const p = s.patients[3]!;
     const windows = await bookableWindows();

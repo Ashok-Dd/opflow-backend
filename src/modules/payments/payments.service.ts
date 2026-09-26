@@ -78,6 +78,35 @@ export class PaymentsService {
   }
 
   /**
+   * "Was I charged?" for the patient's own booking: when the phone is unsure (Checkout said failed or cancelled,
+   * the confirm call timed out, UPI still processing), this asks Razorpay directly and confirms a captured
+   * payment through the same single path as the webhook. Never charges and never cancels anything.
+   */
+  async checkStatus(patientUserId: string, bookingId: string): Promise<{ status: string; paid: boolean }> {
+    const booking = await this.dbs.as({ role: 'patient', userId: patientUserId }, (tx) =>
+      tx.selectFrom('bookings').select(['id', 'status']).where('id', '=', bookingId).where('patientUserId', '=', patientUserId).executeTakeFirst(),
+    );
+    if (!booking) throw new AppError('BOOKING_NOT_FOUND', 'We could not find this booking.', HttpStatus.NOT_FOUND);
+    if (booking.status === 'pending_payment' || booking.status === 'expired') {
+      const orders = await this.dbs.system((tx) =>
+        tx.selectFrom('payments').select(['id', 'razorpayOrderId']).where('bookingId', '=', bookingId).where('status', 'in', ['created', 'authorized']).execute(),
+      );
+      for (const o of orders) {
+        const captured = (await this.gateway.fetchOrderPayments(o.razorpayOrderId).catch(() => [])).find((p) => p.status === 'captured');
+        if (captured) {
+          await this.confirm(o.id, captured, 'patient');
+          break;
+        }
+      }
+    }
+    const now = await this.dbs.system((tx) => tx.selectFrom('bookings').select('status').where('id', '=', bookingId).executeTakeFirstOrThrow());
+    const paid = await this.dbs.system((tx) =>
+      tx.selectFrom('payments').select('id').where('bookingId', '=', bookingId).where('status', '=', 'captured').executeTakeFirst(),
+    );
+    return { status: now.status, paid: !!paid };
+  }
+
+  /**
    * THE place a paid booking becomes confirmed. Called by verify, the webhook and the hold sweeper,
    * possibly at the same moment: the locks and the "already captured" check make it happen exactly once.
    */

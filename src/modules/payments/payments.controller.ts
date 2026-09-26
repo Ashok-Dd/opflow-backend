@@ -7,6 +7,7 @@ import { sha256 } from '../../common/crypto';
 import { AppError } from '../../common/errors/app-error';
 import { Idempotent } from '../../common/http/idempotency';
 import { IdParam, ZBody } from '../../common/http/zod';
+import { RateLimit } from '../../infra/redis/rate-limit';
 import { PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
 import { BookingsService } from '../bookings/bookings.service';
 import { PaymentsService } from './payments.service';
@@ -33,6 +34,16 @@ export class PaymentsController {
   async verify(@PatientId() userId: string, @ZBody(verifyBody) body: z.output<typeof verifyBody>) {
     const r = await this.payments.verify(userId, { orderId: body.razorpay_order_id, paymentId: body.razorpay_payment_id, signature: body.razorpay_signature });
     return { outcome: r.outcome, booking: await this.bookings.get(userId, r.bookingId) };
+  }
+
+  /** "Was I charged?": the phone asks after any doubtful result; confirms a captured payment (never charges). */
+  @Post('payments/:id/check')
+  @Roles('patient')
+  @HttpCode(200)
+  @RateLimit('payment-check', 30, 60, 'user')
+  async check(@PatientId() userId: string, @IdParam() bookingId: string) {
+    const r = await this.payments.checkStatus(userId, bookingId);
+    return { ...r, booking: await this.bookings.get(userId, bookingId) };
   }
 
   /** "Try again" after a failed payment, while the place is still kept. */

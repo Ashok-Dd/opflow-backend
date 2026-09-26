@@ -185,12 +185,25 @@ export class AdminService {
   }
 
   /** Address → map pin (Google Geocoding), when a key is configured. */
+  /**
+   * Address → map points for a hospital. Google Maps when GOOGLE_MAPS_API_KEY is set; otherwise OpenStreetMap
+   * (Nominatim: free, no key; its rules allow this light admin-only use: one search per click, identified).
+   */
   async geocode(address: string) {
     const key = this.env.GOOGLE_MAPS_API_KEY;
-    if (!key) throw new AppError('GEOCODE_OFF', 'Map search is not set up. Please drop the pin by hand.', HttpStatus.NOT_IMPLEMENTED);
-    const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?region=in&address=${encodeURIComponent(address)}&key=${key}`, { signal: AbortSignal.timeout(5000) });
-    const body = (await res.json()) as { results?: { formatted_address: string; geometry: { location: { lat: number; lng: number } } }[] };
-    return (body.results ?? []).slice(0, 5).map((r) => ({ address: r.formatted_address, lat: r.geometry.location.lat, lng: r.geometry.location.lng }));
+    if (key) {
+      const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?region=in&address=${encodeURIComponent(address)}&key=${key}`, { signal: AbortSignal.timeout(6000) });
+      const body = (await res.json()) as { results?: { formatted_address: string; geometry: { location: { lat: number; lng: number } } }[] };
+      return (body.results ?? []).slice(0, 5).map((r) => ({ address: r.formatted_address, lat: r.geometry.location.lat, lng: r.geometry.location.lng }));
+    }
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=in&limit=5&q=${encodeURIComponent(address)}`;
+    const res = await fetch(url, {
+      headers: { 'user-agent': `OPflow-admin/1.0 (${this.env.ADMIN_PUBLIC_URL})`, 'accept-language': 'en-IN' },
+      signal: AbortSignal.timeout(8000),
+    }).catch(() => null);
+    if (!res?.ok) throw new AppError('GEOCODE_UNAVAILABLE', 'Map search is not working right now. Please paste the location from Google Maps.', HttpStatus.SERVICE_UNAVAILABLE, true);
+    const rows = (await res.json()) as { display_name: string; lat: string; lon: string }[];
+    return rows.slice(0, 5).map((r) => ({ address: r.display_name, lat: Number(r.lat), lng: Number(r.lon) }));
   }
 
   // ── Bookings ──────────────────────────────────────────────────────────────────────────────────────

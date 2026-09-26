@@ -134,14 +134,20 @@ export class MeController {
   // ── Messages ─────────────────────────────────────────────────────────────────────────────────────
 
   @Get('notifications')
-  async notifications(@CurrentApp() who: AppPrincipal, @ZQuery(z.object({ cursor: zCursor, limit: zLimit })) q: { cursor?: string; limit: number }) {
-    const offset = decodeCursor(q.cursor);
+  async notifications(
+    @CurrentApp() who: AppPrincipal,
+    @ZQuery(z.object({ cursor: zCursor, limit: zLimit, after: z.iso.datetime({ offset: true }).optional() })) q: { cursor?: string; limit: number; after?: string },
+  ) {
+    // `after`: only messages newer than the phone's newest one (the regular check), instead of the whole page.
+    const offset = q.after ? 0 : decodeCursor(q.cursor);
     const identity = who.role === 'doctor' ? { role: 'doctor' as const, userId: who.userId, doctorId: who.doctorId! } : { role: 'patient' as const, userId: who.userId };
     return this.dbs.as(identity, async (tx) => {
       const rows = await tx
         .selectFrom('notifications')
         .select(['id', 'kind', 'title', 'body', 'bookingId', 'data', 'readAt', 'createdAt'])
         .where('userId', '=', who.userId)
+        // Millisecond precision on both sides: the phone gets times to the millisecond, the database keeps microseconds.
+        .$if(!!q.after, (qb) => qb.where(sql<Date>`date_trunc('milliseconds', created_at)`, '>', new Date(q.after!)))
         .orderBy('createdAt', 'desc')
         .limit(q.limit + 1)
         .offset(offset)
