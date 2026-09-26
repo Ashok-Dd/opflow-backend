@@ -34,7 +34,12 @@ Render asks for the secret values. Copy each one from **`backend/.env.render`** 
 | `DATABASE_URL` | the `opflow_api` login (never the `postgres` one: the server refuses it) |
 | `JWT_ACCESS_PRIVATE_KEY_B64`, `JWT_ACCESS_PUBLIC_KEY_B64` | token signing keys |
 | `PASSWORD_PEPPER`, `DATA_ENCRYPTION_KEY` | keep a safe copy: losing them resets every password |
-| `DEMO_OTP_CODE` | the 6-digit code testers type at patient login |
+| `DEMO_OTP_CODE` | required in demo mode (a fallback test code) |
+| `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY_B64` | push notifications |
+| `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` | Razorpay **test** mode |
+
+Patient login uses SMS codes (`PHONE_LOGIN=sms`). Until the MSG91 OTP template is set, no SMS is sent and the app
+shows the code on its code screen (test server only).
 
 The database certificate (`DB_SSL_CA_B64`) is already in `render.yaml`.
 
