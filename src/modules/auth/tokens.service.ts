@@ -100,12 +100,23 @@ export class TokensService {
         .executeTakeFirst();
       if (!row) return { error: relogin() };
       if ((audience === 'admin') !== (row.adminId !== null)) return { error: relogin() };
-      if (row.replacedBy && row.revokedAt && Date.now() - new Date(row.revokedAt).getTime() < 30_000) {
+      // Phone on a weak signal: it refreshed, the server answered, the answer never arrived, so it tries again
+      // with the old token. If the token it was swapped for has never been used (and it's within 2 minutes), that
+      // is a lost reply, not theft: cancel the unused one and issue a fresh pair.
+      let lostReply = false;
+      if (audience === 'app' && row.replacedBy && row.revokedAt && Date.now() - new Date(row.revokedAt).getTime() < 120_000) {
+        const successor = await tx.selectFrom('refreshTokens').select(['id', 'revokedAt', 'replacedBy']).where('id', '=', row.replacedBy).forUpdate().executeTakeFirst();
+        if (successor && !successor.revokedAt && !successor.replacedBy) {
+          await tx.updateTable('refreshTokens').set({ revokedAt: new Date() }).where('id', '=', successor.id).execute();
+          lostReply = true;
+        }
+      }
+      if (!lostReply && row.replacedBy && row.revokedAt && Date.now() - new Date(row.revokedAt).getTime() < 30_000) {
         // Two requests refreshed at the same moment (e.g. the admin site prefetching two pages). The other one
         // already got the new pair: refuse this one, but don't end the session.
         return { error: relogin() };
       }
-      if (row.revokedAt || row.replacedBy) {
+      if (!lostReply && (row.revokedAt || row.replacedBy)) {
         // Already used: someone else has a copy. End every token of this session.
         await tx.updateTable('refreshTokens').set({ revokedAt: new Date() }).where('familyId', '=', row.familyId).where('revokedAt', 'is', null).execute();
         return { error: relogin() };

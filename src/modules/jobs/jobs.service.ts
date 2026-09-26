@@ -329,19 +329,26 @@ export class JobsService implements OnApplicationShutdown {
   }
 
   async expireEmergency(): Promise<number> {
-    const r = await this.dbs.sys(sql<{ userId: string; untilAt: Date }>`
+    const r = await this.dbs.sys(sql<{ userId: string; untilAt: Date; status: string }>`
       with off as (
-        update emergency_status e set status = 'off', until_at = null, hospital_id = null
-          from (select doctor_id, until_at from emergency_status where status = 'available_till' and until_at < now() for update) old
+        update emergency_status e set status = 'off', until_at = null, hospital_id = null, updated_at = now()
+          from (select doctor_id, until_at, status from emergency_status
+                 where (status = 'available_till' and until_at < now())
+                    -- "Available now" left on for 12 hours: surely forgotten (patients must never find a sleeping doctor)
+                    or (status = 'available_now' and updated_at < now() - interval '12 hours')
+                 for update) old
          where e.doctor_id = old.doctor_id
-        returning e.doctor_id, old.until_at)
-      select d.user_id, off.until_at from off join doctors d on d.id = off.doctor_id`);
+        returning e.doctor_id, coalesce(old.until_at, now()) as until_at, old.status)
+      select d.user_id, off.until_at, off.status from off join doctors d on d.id = off.doctor_id`);
     for (const row of r.rows) {
       await this.deliverNotify({
         userId: row.userId,
         kind: 'system',
         title: 'Emergency status is off',
-        body: 'Your "available till" time is over, so patients no longer see you for emergencies. Turn it on again from the top bar.',
+        body:
+          row.status === 'available_now'
+            ? 'It was on for 12 hours, so we turned it off: patients must never find a doctor who is not there. Turn it on again from the top bar.'
+            : 'Your "available till" time is over, so patients no longer see you for emergencies. Turn it on again from the top bar.',
         data: { forDoctor: 'true' },
         dedupeKey: `emergency-off:${row.userId}:${new Date(row.untilAt ?? Date.now()).toISOString()}`,
       });

@@ -406,7 +406,7 @@ run('OPflow end to end', () => {
     expect(after.body.booking.token).toBeGreaterThan(0);
     // Asking again changes nothing; the patient is told exactly once.
     await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
-    for (let i = 0; i < 3; i++) await jobs.relay();
+    for (let i = 0; i < 15; i++) await jobs.relay(); // until the queue is empty (other tests queue messages too)
     const told = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where booking_id = ${bookingId} and title = 'Booking confirmed'`);
     expect(told.rows[0]!.n).toBe(1);
     // Another patient cannot ask about this booking.
@@ -600,13 +600,15 @@ run('OPflow end to end', () => {
 
   it('refresh tokens rotate; reusing an old one ends the whole session', async () => {
     const p = s.patients[7]!;
-    const r1 = await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(200);
-    // Within 30 s a second use is treated as two tabs refreshing at once: refused, session kept.
-    await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(401);
-    // Later, the same old token again means it was copied: the whole session ends.
+    await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(200);
+    // The phone never got that answer (weak signal) and tries again with the old token: the new token was never
+    // used, so this is a lost reply, not theft. A fresh pair; the unused one is cancelled.
+    const r2 = await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(200);
+    const r3 = await api().post('/v1/auth/refresh').send({ refreshToken: r2.body.refreshToken }).expect(200);
+    // Now the old token again, a minute later, after its successor was used: a copy. The whole session ends.
     await dbs.system((tx) => sql`update refresh_tokens set revoked_at = now() - interval '1 minute' where replaced_by is not null and user_id = ${p.id}`.execute(tx));
     await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(401); // stolen copy
-    await api().post('/v1/auth/refresh').send({ refreshToken: r1.body.refreshToken }).expect(401); // whole family ended
+    await api().post('/v1/auth/refresh').send({ refreshToken: r3.body.refreshToken }).expect(401); // whole family ended
   });
 
   it('SMS login codes: sent, checked once, 5 tries, a 30 s wait between codes', async () => {
@@ -667,6 +669,20 @@ run('OPflow end to end', () => {
     expect(bad.status).toBe(400);
     expect(bad.body.error.code).toBe('INVALID_INPUT');
     expect(bad.body.error.details.fields.windowId).toBeDefined();
+  });
+
+  it('payment failed or closed, then "Try again" for the same doctor and day: the retry works at once', async () => {
+    const p = await newPatient(40);
+    const w = (await bookableWindows()).find((x) => x.free > 1)!;
+    const first = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', randomUUID()).send({ windowId: w.id }).expect(201);
+    // Nothing paid. The patient taps "Try again": a NEW hold, not "You already have a booking…".
+    const again = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', randomUUID()).send({ windowId: w.id }).expect(201);
+    expect(again.body.booking.id).not.toBe(first.body.booking.id);
+    const old = await dbs.sys(sql<{ status: string }>`select status from bookings where id = ${first.body.booking.id}`);
+    expect(old.rows[0]!.status).toBe('expired');
+    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: again.body.payment.orderId }).expect(200);
+    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    expect(v.body.booking.status).toBe('confirmed');
   });
 
   it('doctors hear about their work: new bookings, time changes, emergency off, OPD soon, tomorrow; with their own settings', async () => {
@@ -780,7 +796,7 @@ run('OPflow end to end', () => {
     // Age one live-line event past 30 days (the table refuses edits, so insert an old one directly).
     const s0 = await dbs.sys(sql<{ id: string }>`select session_id as id from queue_events limit 1`);
     await dbs.sys(sql`insert into queue_events (session_id, version, type, at) values (${s0.rows[0]!.id}, 999999, 'test_old', now() - interval '40 days')`);
-    const p = await newPatient(61);
+    const p = s.patients[1]!; // an existing patient (new logins here would hit the login rate limit)
     await dbs.sys(sql`insert into notifications (user_id, kind, title, body, created_at) values (${p.id}, 'system', 'old', 'old', now() - interval '100 days')`);
     await expect(dbs.sys(sql`delete from queue_events where type <> 'test_old'`)).rejects.toThrow(/append-only/); // recent ones stay protected
     const r = await jobs.housekeeping();

@@ -455,6 +455,50 @@ export class PaymentsService {
    * Job (every 30 s): holds whose time ran out. Razorpay is asked once first, in case the payment went
    * through and its webhook is late. Works without Redis.
    */
+  /**
+   * Before a patient holds a new place: their own unfinished holds (a payment that failed or was closed, then
+   * "Try again") would block the retry for up to 10 minutes ("You already have a booking…", "finish paying for
+   * your other booking first"). Each is asked about at Razorpay: paid → confirmed (the right answer), not paid
+   * → released now. A payment that still arrives later is handled like any late payment (place if free, else
+   * money back).
+   */
+  async releaseOwnHolds(patientUserId: string): Promise<void> {
+    const mine = await this.dbs.system((tx) =>
+      tx.selectFrom('bookings').select(['id']).where('patientUserId', '=', patientUserId).where('status', '=', 'pending_payment').limit(5).execute(),
+    );
+    for (const b of mine) {
+      const orders = await this.dbs.system((tx) =>
+        tx.selectFrom('payments').select(['id', 'razorpayOrderId']).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).execute(),
+      );
+      let paid = false;
+      let unsure = false;
+      for (const o of orders) {
+        try {
+          const ps = await this.gateway.fetchOrderPayments(o.razorpayOrderId);
+          const captured = ps.find((x) => x.status === 'captured');
+          if (captured) {
+            await this.confirm(o.id, captured, 'patient');
+            paid = true;
+            break;
+          }
+          // Money on its way (authorized): leave the hold; the sweeper settles it.
+          if (ps.some((x) => x.status === 'authorized')) unsure = true;
+        } catch {
+          unsure = true; // Razorpay unreachable: keep the hold, never guess
+        }
+      }
+      if (paid || unsure) continue;
+      await this.dbs.system(async (tx) => {
+        const row = await tx.selectFrom('bookings').select(['id', 'status']).where('id', '=', b.id).forUpdate().executeTakeFirst();
+        if (row?.status !== 'pending_payment') return;
+        await tx.updateTable('bookings').set({ status: 'expired' }).where('id', '=', row.id).execute();
+        await sql`update window_slots set state = 'free', booking_id = null, held_until = null, version = version + 1
+                   where booking_id = ${row.id} and state = 'held'`.execute(tx);
+        await tx.insertInto('bookingEvents').values({ bookingId: row.id, type: 'expired', actorType: 'patient', actorId: patientUserId, data: JSON.stringify({ why: 'new_attempt' }) }).execute();
+      });
+    }
+  }
+
   async expireHolds(limit = 200): Promise<{ expired: number; confirmed: number }> {
     const due = await this.dbs.system((tx) =>
       tx

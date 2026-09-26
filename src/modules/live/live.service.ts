@@ -265,7 +265,11 @@ export class LiveService {
           await ensureRunning();
           const seen = await finishCurrent();
           if (seen) await this.patientNotice(tx, seen, 'system', 'Visit done', 'Your visit is done. Your receipt is in the app under My bookings. Take care!', `done:${seen}`);
-          const next = await tx.selectFrom('queueEntries').select('bookingId').where('sessionId', '=', sessionId).where('state', '=', 'waiting').orderBy('orderKey').limit(1).forUpdate().executeTakeFirst();
+          // The next person who has reached; if nobody is marked as reached (there is no check-in desk), the next
+          // token in order — the doctor calls it out, and "Skip" / "Did not come" handle someone who isn't there.
+          const next =
+            (await tx.selectFrom('queueEntries').select('bookingId').where('sessionId', '=', sessionId).where('state', '=', 'waiting').orderBy('orderKey').limit(1).forUpdate().executeTakeFirst()) ??
+            (await tx.selectFrom('queueEntries').select('bookingId').where('sessionId', '=', sessionId).where('state', '=', 'not_come').orderBy('orderKey').limit(1).forUpdate().executeTakeFirst());
           if (next) {
             await callIn(next.bookingId);
             called = next.bookingId;

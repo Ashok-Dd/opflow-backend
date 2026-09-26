@@ -69,6 +69,8 @@ export class BookingsService {
   /** Step 1 of booking: keep one place for 10 minutes and open a Razorpay order for the fee. */
   async hold(userId: string, input: { windowId: string; note?: string }, idempotencyKey?: string) {
     await this.rules.requireBookingsOn();
+    // A retry after a failed or closed payment must not be blocked by the unfinished first try.
+    if (!idempotencyKey || !(await this.isReplay(userId, idempotencyKey))) await this.payments.releaseOwnHolds(userId);
     const holdMinutes = await this.rules.holdMinutes();
     const feePercent = await this.rules.platformFeePercent();
     let held: { bookingId: string; amount: number; code: string; holdExpiresAt: Date };
@@ -160,9 +162,19 @@ export class BookingsService {
     return this.openOrder(userId, held);
   }
 
+  /** Same Idempotency-Key as an earlier hold: a network retry of the same tap (keep that hold). */
+  private async isReplay(userId: string, key: string): Promise<boolean> {
+    const b = await this.dbs.system((tx) =>
+      tx.selectFrom('bookings').select('id').where('patientUserId', '=', userId).where('idempotencyKey', '=', key).executeTakeFirst(),
+    );
+    return !!b;
+  }
+
   /** Emergency consultation: fee + emergency charge, E-token, top of the line. */
   async holdEmergency(userId: string, doctorId: string, idempotencyKey?: string) {
     await this.rules.requireEmergencyConsultOn();
+    // A retry after a failed or closed payment must not be blocked by the unfinished first try.
+    if (!idempotencyKey || !(await this.isReplay(userId, idempotencyKey))) await this.payments.releaseOwnHolds(userId);
     const holdMinutes = await this.rules.holdMinutes();
     const feePercent = await this.rules.platformFeePercent();
     const chargePercent = await this.rules.emergencyChargePercent();
