@@ -27,7 +27,13 @@ const prefsBody = z.object({
   lateAlerts: z.boolean().optional(),
   turnAlerts: z.boolean().optional(),
   emailReceipts: z.boolean().optional(),
+  // Doctors
+  newBookings: z.boolean().optional(),
+  bookingChanges: z.boolean().optional(),
+  eveningSummary: z.boolean().optional(),
 });
+const prefColumns = ['reminders', 'lateAlerts', 'turnAlerts', 'emailReceipts', 'newBookings', 'bookingChanges', 'eveningSummary'] as const;
+const prefDefaults = { reminders: true, lateAlerts: true, turnAlerts: true, emailReceipts: true, newBookings: true, bookingChanges: true, eveningSummary: true };
 const readBody = z.union([z.object({ ids: z.array(z.uuid()).min(1).max(100) }), z.object({ all: z.literal(true) })]);
 const ticketBody = z.object({ message: z.string().trim().min(5, 'Please write a little more').max(2000) });
 
@@ -70,20 +76,24 @@ export class MeController {
     return this.me(userId);
   }
 
+  /** Which messages reach the phone. Patients and doctors (each sees their own switches). */
   @Get('me/notification-prefs')
-  @Roles('patient')
-  async prefs(@PatientId() userId: string) {
-    const p = await this.dbs.db.selectFrom('notificationPrefs').select(['reminders', 'lateAlerts', 'turnAlerts', 'emailReceipts']).where('userId', '=', userId).executeTakeFirst();
-    return p ?? { reminders: true, lateAlerts: true, turnAlerts: true, emailReceipts: true };
+  async prefs(@CurrentApp() who: AppPrincipal) {
+    return this.prefsOf(who.userId);
   }
 
   @Patch('me/notification-prefs')
-  @Roles('patient')
-  async setPrefs(@PatientId() userId: string, @ZBody(prefsBody) body: z.output<typeof prefsBody>) {
+  async setPrefs(@CurrentApp() who: AppPrincipal, @ZBody(prefsBody) body: z.output<typeof prefsBody>) {
+    const userId = who.userId;
     await this.dbs.system((tx) =>
-      tx.insertInto('notificationPrefs').values({ userId, ...body }).onConflict((oc) => oc.column('userId').doUpdateSet(body)).execute(),
+      tx.insertInto('notificationPrefs').values({ userId, ...body }).onConflict((oc) => oc.column('userId').doUpdateSet({ ...body, updatedAt: new Date() })).execute(),
     );
-    return this.prefs(userId);
+    return this.prefsOf(userId);
+  }
+
+  private async prefsOf(userId: string) {
+    const p = await this.dbs.db.selectFrom('notificationPrefs').select([...prefColumns]).where('userId', '=', userId).executeTakeFirst();
+    return p ?? prefDefaults;
   }
 
   /** Register this phone for pushes (patients and doctors). */

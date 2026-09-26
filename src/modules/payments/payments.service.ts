@@ -290,6 +290,18 @@ export class PaymentsService {
         dedupeKey: `emergency-doctor:${bookingId}`,
       });
     }
+    if (r.source !== 'emergency' && r.doctorUserId) {
+      await notify(tx, {
+        userId: r.doctorUserId,
+        kind: 'booked',
+        title: 'New booking',
+        body: `${r.patientName} booked ${when} at ${r.hospitalName}. Token ${tokenLabel(r.source, r.token)}.`,
+        bookingId,
+        data: { forDoctor: 'true' },
+        pref: 'newBookings',
+        dedupeKey: `booked-doctor:${bookingId}`,
+      });
+    }
     if (r.source !== 'emergency' && r.windowId) {
       const start = new Date(r.startsAt).getTime();
       for (const [which, before] of [['day', 24 * 3_600_000], ['hour', 3_600_000]] as const) {
@@ -500,6 +512,7 @@ export class PaymentsService {
        order by t.release_at limit ${limit}`);
     let released = 0;
     let waiting = 0;
+    const sent = new Map<string, number>(); // doctor → paise sent in this run
     for (const t of due.rows) {
       if (!t.accountId || t.accountStatus !== 'active' || !t.razorpayPaymentId) {
         waiting++;
@@ -511,9 +524,24 @@ export class PaymentsService {
           tx.updateTable('transfers').set({ status: 'released', releasedAt: new Date(), razorpayTransferId: r.id }).where('id', '=', t.id).where('status', '=', 'on_hold').execute(),
         );
         released++;
+        sent.set(t.doctorId, (sent.get(t.doctorId) ?? 0) + t.amountPaise);
       } catch (err) {
         this.log.warn(`Transfer ${t.id} not released yet: ${(err as Error).message}`);
       }
+    }
+    // One message per doctor per run, not one per patient.
+    for (const [doctorId, paise] of sent) {
+      await this.dbs.system(async (tx) => {
+        const d = await tx.selectFrom('doctors').select('userId').where('id', '=', doctorId).executeTakeFirst();
+        if (!d?.userId) return;
+        await notify(tx, {
+          userId: d.userId,
+          kind: 'system',
+          title: 'Money sent to your bank',
+          body: `${money(paise).display} is on its way to your bank account. It usually arrives within 1 working day.`,
+          data: { forDoctor: 'true' },
+        });
+      });
     }
     return { released, waiting };
   }

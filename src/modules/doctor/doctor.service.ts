@@ -202,7 +202,28 @@ export class DoctorService {
         .executeTakeFirst();
       if (!b) throw new AppError('BOOKING_NOT_FOUND', 'We could not find this booking.', HttpStatus.NOT_FOUND);
       const events = await tx.selectFrom('bookingEvents').select(['type', 'at']).where('bookingId', '=', id).orderBy('at').execute();
-      return { ...b, tokenLabel: tokenLabel(b.source, b.token), fee: money(b.feePaise), events };
+      // When (the booked hour) and where the patient is in the line, so a booking opened from a message shows fully.
+      const when = await sql<{ startsAt: Date | null; queueState: string | null; needsNewTimeSince: Date | null }>`
+        select coalesce(w.starts_at, s.starts_at) as starts_at, q.state as queue_state, b.needs_new_time_since
+          from bookings b join opd_sessions s on s.id = b.session_id
+          left join opd_windows w on w.id = b.window_id left join queue_entries q on q.booking_id = b.id
+         where b.id = ${id}`.execute(tx);
+      const w = when.rows[0];
+      return {
+        ...b,
+        bookingId: b.id,
+        name: b.patientName,
+        age: b.patientAge,
+        gender: b.patientGender,
+        emergency: b.source === 'emergency',
+        startsAt: w?.startsAt ?? null,
+        state: w?.queueState ?? null,
+        waitingForNewTime: !!w?.needsNewTimeSince,
+        changed: b.rescheduleCount > 0,
+        tokenLabel: tokenLabel(b.source, b.token),
+        fee: money(b.feePaise),
+        events,
+      };
     });
   }
 
@@ -359,6 +380,8 @@ export class DoctorService {
           .where('doctorId', '=', d.doctorId)
           .where('sessionDate', '=', day.date)
           .where('status', '=', 'confirmed')
+          // Patients already asked to pick a new time are not on this day any more.
+          .where('needsNewTimeSince', 'is', null)
           .$if(!!day.hospitalId, (q) => q.where('hospitalId', '=', day.hospitalId!))
           .executeTakeFirstOrThrow();
         const already = await tx.selectFrom('doctorLeaves').select('id').where('doctorId', '=', d.doctorId).where('date', '=', day.date).executeTakeFirst();

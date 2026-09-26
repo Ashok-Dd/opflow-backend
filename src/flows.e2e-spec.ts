@@ -669,6 +669,79 @@ run('OPflow end to end', () => {
     expect(bad.body.error.details.fields.windowId).toBeDefined();
   });
 
+  it('doctors hear about their work: new bookings, time changes, emergency off, OPD soon, tomorrow; with their own settings', async () => {
+    for (let i = 0; i < 10; i++) await jobs.relay();
+    const doc = await dbs.db.selectFrom('doctors').select('userId').where('id', '=', s.doctorId).executeTakeFirstOrThrow();
+    const titles = async () =>
+      (await dbs.sys(sql<{ title: string }>`select title from notifications where user_id = ${doc.userId!}`)).rows.map((r) => r.title);
+
+    // Every paid booking tells the doctor; an emergency one too, with its own words.
+    expect(await titles()).toEqual(expect.arrayContaining(['New booking', 'Emergency patient coming']));
+    const moved = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from bookings where reschedule_count > 0 and doctor_id = ${s.doctorId}`);
+    if (moved.rows[0]!.n > 0) expect(await titles()).toContain('Patient changed the time');
+
+    // The doctor's Messages list (same API as patients).
+    const inbox = await api().get('/v1/notifications').set(bearer(s.doctorToken)).query({ limit: 50 }).expect(200);
+    expect(inbox.body.items.some((m: { title: string }) => m.title === 'New booking')).toBe(true);
+    expect(inbox.body.unread).toBeGreaterThan(0);
+    await api().post('/v1/notifications/read').set(bearer(s.doctorToken)).send({ all: true }).expect(200);
+    const after = await api().get('/v1/notifications').set(bearer(s.doctorToken)).query({ limit: 1 }).expect(200);
+    expect(after.body.unread).toBe(0);
+
+    // One booking opened from a message: with its time and place in the line.
+    const one = await api().get(`/v1/doctor/bookings/${s.bookingId}`).set(bearer(s.doctorToken)).expect(200);
+    expect(one.body.name).toBeTruthy();
+    expect(one.body.startsAt).toBeTruthy();
+    expect(one.body.sessionDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+
+    // Settings: a doctor turns "new booking" pushes off. The message still lands in the list, without a push.
+    const prefs = await api().get('/v1/me/notification-prefs').set(bearer(s.doctorToken)).expect(200);
+    expect(prefs.body.newBookings).toBe(true);
+    const off = await api().patch('/v1/me/notification-prefs').set(bearer(s.doctorToken)).send({ newBookings: false }).expect(200);
+    expect(off.body.newBookings).toBe(false);
+    expect(off.body.eveningSummary).toBe(true);
+    const bad = await api().patch('/v1/me/notification-prefs').set(bearer(s.doctorToken)).send({ newBookings: 'no' });
+    expect(bad.status).toBe(400);
+    await api().patch('/v1/me/notification-prefs').set(bearer(s.doctorToken)).send({ newBookings: true }).expect(200);
+
+    // "Available till" ran out: status off, and the doctor is told once.
+    await dbs.sys(sql`insert into emergency_status (doctor_id, hospital_id, status, until_at)
+                      values (${s.doctorId}, ${s.hospitalId}, 'available_till', now() - interval '1 minute')
+                      on conflict (doctor_id) do update set hospital_id = excluded.hospital_id, status = 'available_till', until_at = excluded.until_at`);
+    expect(await jobs.expireEmergency()).toBe(1);
+    expect(await jobs.expireEmergency()).toBe(0);
+    const em = await api().get('/v1/doctor/emergency').set(bearer(s.doctorToken)).expect(200);
+    expect(em.body.status).toBe('off');
+    expect(await titles()).toContain('Emergency status is off');
+
+    // "Your OPD starts soon": an OPD 20 minutes away, once only.
+    const soon = await dbs.sys(sql<{ id: string }>`
+      select id from opd_sessions where doctor_id = ${s.doctorId} and status = 'scheduled' and starts_at > now() + interval '1 day' order by starts_at limit 1`);
+    if (soon.rows[0]) {
+      const id = soon.rows[0].id;
+      const was = await dbs.sys(sql<{ startsAt: Date }>`select starts_at from opd_sessions where id = ${id}`);
+      await dbs.sys(sql`update opd_sessions set starts_at = now() + interval '20 minutes' where id = ${id}`).catch(() => undefined);
+      const moved20 = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from opd_sessions where id = ${id} and starts_at < now() + interval '1 hour'`);
+      if (moved20.rows[0]!.n > 0) {
+        expect(await jobs.opdSoon()).toBeGreaterThan(0);
+        await jobs.opdSoon();
+        const n = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where user_id = ${doc.userId!} and title = 'Your OPD starts soon'`);
+        expect(n.rows[0]!.n).toBe(1);
+        await dbs.sys(sql`update opd_sessions set starts_at = ${was.rows[0]!.startsAt} where id = ${id}`);
+      }
+    }
+
+    // 8 PM summary of tomorrow: one message per doctor, once per day.
+    const tomorrow = await dbs.sys(sql<{ n: number }>`
+      select count(*)::int as n from bookings b join opd_sessions o on o.id = b.session_id
+       where b.doctor_id = ${s.doctorId} and b.session_date = (now() at time zone 'Asia/Kolkata')::date + 1
+         and b.status = 'confirmed' and b.needs_new_time_since is null and o.status = 'scheduled'`);
+    await jobs.eveningSummary();
+    await jobs.eveningSummary();
+    const summaries = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where user_id = ${doc.userId!} and title = 'Tomorrow''s bookings'`);
+    expect(summaries.rows[0]!.n).toBe(tomorrow.rows[0]!.n > 0 ? 1 : 0);
+  });
+
   it('suspending a doctor hides them at once, refunds future bookings and ends their logins', async () => {
     const superFresh = await stepUp(s.superToken, s.superId, s.superSecret);
     const r = await api().post(`/v1/admin/doctors/${s.doctorId}/suspend`).set(bearer(superFresh)).send({ reason: 'Registration expired' }).expect(200);

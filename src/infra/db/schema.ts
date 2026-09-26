@@ -414,8 +414,11 @@ export interface JobLeases {
 }
 
 export interface NotificationPrefs {
+  bookingChanges: Generated<boolean>;
   emailReceipts: Generated<boolean>;
+  eveningSummary: Generated<boolean>;
   lateAlerts: Generated<boolean>;
+  newBookings: Generated<boolean>;
   reminders: Generated<boolean>;
   turnAlerts: Generated<boolean>;
   updatedAt: Generated<Timestamp>;

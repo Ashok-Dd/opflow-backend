@@ -28,6 +28,8 @@ export interface NotifyPayload {
   body: string;
   bookingId?: string | null;
   data?: Record<string, string>;
+  /** The setting that can turn this push off (the message still shows in the app). */
+  pref?: 'newBookings' | 'bookingChanges' | 'eveningSummary' | 'reminders';
   /** The same key never notifies the same person twice. */
   dedupeKey?: string;
   /** Also send a phone push (respecting the person's settings). Default true. */

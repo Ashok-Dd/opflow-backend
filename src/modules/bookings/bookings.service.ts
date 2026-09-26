@@ -414,6 +414,21 @@ export class BookingsService {
           bookingId,
           dedupeKey: `changed:${bookingId}:${nw.id}`,
         });
+        // The doctor sees the change too (their line for both days changed).
+        const doc = await sql<{ userId: string; patientName: string }>`
+          select d.user_id, b.patient_name from bookings b join doctors d on d.id = b.doctor_id where b.id = ${bookingId}`.execute(tx);
+        if (doc.rows[0]?.userId) {
+          await notify(tx, {
+            userId: doc.rows[0].userId,
+            kind: 'changed',
+            title: providerMove ? 'Patient picked a new time' : 'Patient changed the time',
+            body: `${doc.rows[0].patientName} is now on ${istDayLabel(nw.date)}, ${istRange(new Date(when.startsAt), new Date(when.endsAt))}. Token ${String(token).padStart(2, '0')}.`,
+            bookingId,
+            data: { forDoctor: 'true' },
+            pref: 'bookingChanges',
+            dedupeKey: `changed-doctor:${bookingId}:${nw.id}`,
+          });
+        }
         for (const [which, before] of [['day', 24 * 3_600_000], ['hour', 3_600_000]] as const) {
           const at = new Date(when.startsAt).getTime() - before;
           if (at > Date.now() + 5 * 60_000) {

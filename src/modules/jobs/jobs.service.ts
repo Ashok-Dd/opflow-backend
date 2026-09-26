@@ -5,7 +5,7 @@ import sharp from 'sharp';
 import { captureError } from '../../common/sentry';
 import type { NotifyPayload, OutboxTopic } from '../../common/outbox';
 import { uuidv7 } from '../../common/outbox';
-import { istClock, istDayLabel, istToday } from '../../common/time';
+import { addDays, istClock, istDayLabel, istToday } from '../../common/time';
 import { ENV, Env } from '../../config/env';
 import { LiveBus } from '../../infra/bus/live-bus';
 import { DbService } from '../../infra/db/db.service';
@@ -66,11 +66,13 @@ export class JobsService implements OnApplicationShutdown {
     this.timed('payouts.release', 60 * 60, () => this.payments.releaseDueTransfers());
     this.timed('sessions.auto', 5 * 60, () => this.autoSessions());
     this.timed('emergency.expire', 5 * 60, () => this.expireEmergency());
+    this.timed('opd.soon', 5 * 60, () => this.opdSoon());
     this.timed('moves.refund', 30 * 60, () => this.bookings.refundUnpickedMoves());
     this.timed('housekeeping', 60 * 60, () => this.housekeeping());
     this.timed('invariants.check', 6 * 60 * 60, () => this.invariants());
     this.daily('sessions.generate', '00:30', () => this.schedule.syncAll());
     this.daily('privacy.purge', '03:00', () => this.privacyPurge());
+    this.daily('doctor.summary', '20:00', () => this.eveningSummary());
     // Right after start, make sure the next days exist (a fresh database, or a missed night).
     setTimeout(() => void this.runLeased('sessions.generate.boot', 6 * 3600, () => this.schedule.syncAll()), 3000).unref();
   }
@@ -217,6 +219,7 @@ export class JobsService implements OnApplicationShutdown {
     if (!inserted || n.push === false) return;
     const prefs = await this.dbs.db.selectFrom('notificationPrefs').selectAll().where('userId', '=', n.userId).executeTakeFirst();
     if (prefs) {
+      if (n.pref && prefs[n.pref] === false) return;
       if (n.kind === 'reminder' && !prefs.reminders) return;
       if (n.kind === 'late' && !prefs.lateAlerts) return;
       if (n.kind === 'turn' && !prefs.turnAlerts) return;
@@ -298,6 +301,7 @@ export class JobsService implements OnApplicationShutdown {
     let neverStarted = 0;
     for (const s of stale) {
       const publishes: { sessionId: string; version: number }[] = [];
+      let outcome: 'cancelled' | 'closed' | null = null;
       await this.dbs.system(async (tx) => {
         const locked = await lockSession(tx, s.id);
         if (!['scheduled', 'running', 'paused'].includes(locked.status)) return;
@@ -310,27 +314,108 @@ export class JobsService implements OnApplicationShutdown {
           await tx.updateTable('opdSessions').set({ status: 'cancelled' }).where('id', '=', s.id).execute();
           await tx.updateTable('opdWindows').set({ status: 'closed' }).where('sessionId', '=', s.id).execute();
           neverStarted++;
+          outcome = 'cancelled';
         } else {
           await tx.updateTable('queueEntries').set({ state: 'did_not_come' }).where('sessionId', '=', s.id).where('state', '=', 'not_come').execute();
           await this.live.endSession(tx, locked, 'move', { type: 'system', id: null }, 'The OPD was closed automatically', publishes);
           ended++;
+          outcome = 'closed';
         }
       }, 60_000);
       for (const p of publishes) this.bus.publish(p);
+      if (outcome) await this.tellDoctorAboutSession(s.id, outcome);
     }
     return { markedNotCome: Number(marked.numAffectedRows ?? 0), ended, neverStarted };
   }
 
   async expireEmergency(): Promise<number> {
-    const r = await this.dbs.system((tx) =>
-      tx
-        .updateTable('emergencyStatus')
-        .set({ status: 'off', untilAt: null, hospitalId: null })
-        .where('status', '=', 'available_till')
-        .where('untilAt', '<', new Date())
-        .executeTakeFirst(),
-    );
-    return Number(r.numUpdatedRows);
+    const r = await this.dbs.sys(sql<{ userId: string; untilAt: Date }>`
+      with off as (
+        update emergency_status e set status = 'off', until_at = null, hospital_id = null
+          from (select doctor_id, until_at from emergency_status where status = 'available_till' and until_at < now() for update) old
+         where e.doctor_id = old.doctor_id
+        returning e.doctor_id, old.until_at)
+      select d.user_id, off.until_at from off join doctors d on d.id = off.doctor_id`);
+    for (const row of r.rows) {
+      await this.deliverNotify({
+        userId: row.userId,
+        kind: 'system',
+        title: 'Emergency status is off',
+        body: 'Your "available till" time is over, so patients no longer see you for emergencies. Turn it on again from the top bar.',
+        data: { forDoctor: 'true' },
+        dedupeKey: `emergency-off:${row.userId}:${new Date(row.untilAt ?? Date.now()).toISOString()}`,
+      });
+    }
+    return r.rows.length;
+  }
+
+  /** 8 PM: each doctor with patients tomorrow gets one message with the count per hospital. */
+  async eveningSummary(): Promise<number> {
+    const tomorrow = addDays(istToday(new Date()), 1);
+    const r = await this.dbs.sys(sql<{ userId: string; hospitalName: string; firstAt: Date; booked: number }>`
+      select d.user_id, h.name as hospital_name, min(s.starts_at) as first_at, count(b.id)::int as booked
+        from bookings b join opd_sessions s on s.id = b.session_id join doctors d on d.id = b.doctor_id join hospitals h on h.id = b.hospital_id
+       where b.session_date = ${tomorrow} and b.status = 'confirmed' and b.needs_new_time_since is null and s.status = 'scheduled'
+       group by d.user_id, h.name
+       order by d.user_id, min(s.starts_at)`);
+    const byDoctor = new Map<string, string[]>();
+    for (const row of r.rows) {
+      const line = `${row.booked === 1 ? '1 patient' : `${row.booked} patients`} at ${row.hospitalName} from ${istClock(new Date(row.firstAt))}`;
+      byDoctor.set(row.userId, [...(byDoctor.get(row.userId) ?? []), line]);
+    }
+    for (const [userId, lines] of byDoctor) {
+      await this.deliverNotify({
+        userId,
+        kind: 'reminder',
+        title: "Tomorrow's bookings",
+        body: `Tomorrow: ${lines.join('; ')}.`,
+        data: { forDoctor: 'true' },
+        pref: 'eveningSummary',
+        dedupeKey: `summary:${userId}:${tomorrow}`,
+      });
+    }
+    return byDoctor.size;
+  }
+
+  /** "Your OPD starts in 30 minutes": once per OPD, with how many patients are booked. */
+  async opdSoon(): Promise<number> {
+    const r = await this.dbs.sys(sql<{ id: string; userId: string; hospitalName: string; startsAt: Date; endsAt: Date; booked: number }>`
+      select s.id, d.user_id, h.name as hospital_name, s.starts_at, s.ends_at,
+             (select count(*)::int from bookings b where b.session_id = s.id and b.status = 'confirmed') as booked
+        from opd_sessions s join doctors d on d.id = s.doctor_id join hospitals h on h.id = s.hospital_id
+       where s.status = 'scheduled' and s.starts_at > now() and s.starts_at <= now() + interval '35 minutes'
+       limit 200`);
+    for (const s of r.rows) {
+      await this.deliverNotify({
+        userId: s.userId,
+        kind: 'reminder',
+        title: 'Your OPD starts soon',
+        body: `${s.hospitalName} at ${istClock(new Date(s.startsAt))}. ${s.booked === 1 ? '1 patient is' : `${s.booked} patients are`} booked. Press Start OPD when you begin.`,
+        data: { forDoctor: 'true', sessionId: s.id },
+        pref: 'reminders',
+        dedupeKey: `opd-soon:${s.id}`,
+      });
+    }
+    return r.rows.length;
+  }
+
+  /** The doctor hears when OPflow closed or cancelled their OPD by itself. */
+  private async tellDoctorAboutSession(sessionId: string, outcome: 'cancelled' | 'closed'): Promise<void> {
+    const r = await this.dbs.sys(sql<{ userId: string; hospitalName: string; date: string }>`
+      select d.user_id, h.name as hospital_name, s.date from opd_sessions s join doctors d on d.id = s.doctor_id join hospitals h on h.id = s.hospital_id where s.id = ${sessionId}`);
+    const s = r.rows[0];
+    if (!s) return;
+    await this.deliverNotify({
+      userId: s.userId,
+      kind: outcome === 'cancelled' ? 'cancelled' : 'system',
+      title: outcome === 'cancelled' ? 'OPD was not started' : 'OPD closed automatically',
+      body:
+        outcome === 'cancelled'
+          ? `Your OPD at ${s.hospitalName} on ${istDayLabel(s.date)} was never started, so the patients got all their money back.`
+          : `Your OPD at ${s.hospitalName} on ${istDayLabel(s.date)} was still open 3 hours after its end, so OPflow closed it. Patients still waiting were asked to pick a new time.`,
+      data: { forDoctor: 'true', sessionId },
+      dedupeKey: `session-${outcome}:${sessionId}`,
+    });
   }
 
   async housekeeping() {
