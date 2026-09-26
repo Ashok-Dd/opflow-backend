@@ -40,6 +40,15 @@ class JobsInApi implements OnApplicationBootstrap {
   }
 }
 
+function hasPrettyLogs(): boolean {
+  try {
+    require.resolve('pino-pretty');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 @Module({ imports: [JobsModule], controllers: [DevController] })
 class DevModule {}
 
@@ -69,7 +78,8 @@ const devModules =
             res: (res: { statusCode: number }) => ({ status: res.statusCode }),
           },
           autoLogging: { ignore: (req) => req.url === '/health' },
-          transport: env.APP_ENV === 'local' ? { target: 'pino-pretty', options: { singleLine: true } } : undefined,
+          // Readable lines on a laptop; plain JSON on servers (pino-pretty is a dev-only package, absent in the image).
+          transport: env.APP_ENV === 'local' && hasPrettyLogs() ? { target: 'pino-pretty', options: { singleLine: true } } : undefined,
         },
       }),
     }),

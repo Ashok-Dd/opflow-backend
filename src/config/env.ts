@@ -132,6 +132,14 @@ export const envSchema = z
     DEMO_OTP_CODE: z.string().regex(/^\d{6}$/, 'must be 6 digits').optional(),
   })
   .superRefine((env, ctx) => {
+    // On Render, APP_ENV must be set: a server silently running in laptop mode would use test stand-ins.
+    if (env.APP_ENV === 'local' && process.env.RENDER === 'true') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['APP_ENV'],
+        message: 'is not set on this Render server. Paste every setting from backend/.env.render.full (Environment → Add from .env)',
+      });
+    }
     if (env.APP_ENV !== 'local' && !env.DB_SSL_CA_B64) {
       ctx.addIssue({
         code: 'custom',
