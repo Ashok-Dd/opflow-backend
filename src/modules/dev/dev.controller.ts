@@ -106,6 +106,8 @@ export class DevController {
     }
     const data = await s.get(bucket as Bucket, k);
     res.setHeader('Content-Type', k.endsWith('.webp') ? 'image/webp' : k.endsWith('.pdf') ? 'application/pdf' : k.endsWith('.png') ? 'image/png' : 'image/jpeg');
+    // Public photos show on the doctor website and the admin site (other origins), like a CDN would allow.
+    if (bucket === 'public') res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.send(data);
   }
 
