@@ -16,6 +16,7 @@ import { ENV, Env } from './config/env';
 import { JwtService } from './common/auth/jwt.service';
 import { AdminAuthService } from './modules/admin/admin-auth.service';
 import { JobsService } from './modules/jobs/jobs.service';
+import { PaymentsService } from './modules/payments/payments.service';
 
 /**
  * End-to-end journeys through the real HTTP API, WebSocket and background jobs, against a THROWAWAY local
@@ -31,6 +32,7 @@ run('OPflow end to end', () => {
   let app: INestApplication;
   let dbs: DbService;
   let jobs: JobsService;
+  let payments: PaymentsService;
   let base: string;
   const api = () => request(app.getHttpServer());
   const bearer = (t: string) => ({ Authorization: `Bearer ${t}` });
@@ -102,6 +104,7 @@ run('OPflow end to end', () => {
     process.env.API_PUBLIC_URL = base;
     dbs = app.get(DbService);
     jobs = app.get(JobsService);
+    payments = app.get(PaymentsService);
     // A clean slate for the parts of the schema this journey fills.
     await dbs.sys(sql`select 1`);
   });
@@ -683,6 +686,103 @@ run('OPflow end to end', () => {
     const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: again.body.payment.orderId }).expect(200);
     const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
     expect(v.body.booking.status).toBe('confirmed');
+  });
+
+  it('doctor forgets to tick: running behind never removes waiting people; the passed-over one is told; payouts only for finished visits', async () => {
+    // Two patients in one hour of a far-off OPD (so nothing else in this journey touches it).
+    const days = (await bookableWindows()).reduce<Record<string, { id: string; free: number; sessionId: string; startsAt: string }[]>>((m, w) => {
+      (m[w.sessionId] ??= []).push(w);
+      return m;
+    }, {});
+    const [sessionId, ws] = Object.entries(days).reverse().find(([, list]) => list.some((w) => w.free >= 2))!;
+    const w = ws.find((x) => x.free >= 2)!;
+    const a = s.patients[4]!;
+    const b = s.patients[5]!;
+    const ba = (await holdAndPay(a.token, w.id)).verify.booking;
+    const bb = (await holdAndPay(b.token, w.id)).verify.booking;
+    expect(ba.status).toBe('confirmed');
+    expect(bb.status).toBe('confirmed');
+    const [first, second] = ba.token < bb.token ? [ba, bb] : [bb, ba];
+
+    // That hour ended 2 hours ago and the OPD is running; the doctor is slow and has called nobody yet.
+    await dbs.sys(sql`update opd_windows set starts_at = now() - interval '3 hours', ends_at = now() - interval '2 hours' where id = ${w.id}`);
+    await dbs.sys(sql`update opd_sessions set status = 'running', started_at = now() - interval '3 hours' where id = ${sessionId}`);
+    await jobs.autoSessions();
+    const state = async (id: string) => (await dbs.sys(sql<{ state: string }>`select state from queue_entries where booking_id = ${id}`)).rows[0]!.state;
+    expect(await state(first.id)).toBe('not_come'); // still in line: the doctor simply hasn't reached them
+    expect(await state(second.id)).toBe('not_come');
+
+    // The doctor calls and finishes the SECOND one (the first wasn't there): now the first was passed over.
+    await api().post(`/v1/doctor/sessions/${sessionId}/call-now`).set(bearer(s.doctorToken)).send({ bookingId: second.id }).expect(200);
+    await api().post(`/v1/doctor/sessions/${sessionId}/done`).set(bearer(s.doctorToken)).send({}).expect(200);
+    await jobs.autoSessions();
+    expect(await state(first.id)).toBe('did_not_come');
+    for (let i = 0; i < 15; i++) await jobs.relay();
+    const told = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where booking_id = ${first.id} and title = 'Marked as did not come'`);
+    expect(told.rows[0]!.n).toBe(1);
+
+    // Payouts: due by time, but the visits are still open → nothing is sent.
+    await dbs.sys(sql`insert into payout_accounts (doctor_id, razorpay_account_id, status) values (${s.doctorId}, 'acc_test_doctor', 'active')
+                      on conflict (doctor_id) do update set status = 'active', razorpay_account_id = excluded.razorpay_account_id`);
+    const ids = [first.id, second.id];
+    await dbs.sys(sql`update transfers t set release_at = now() - interval '1 minute' from payments p where p.id = t.payment_id and p.booking_id = any(${ids}::uuid[])`);
+    await payments.releaseDueTransfers();
+    const payout = async (id: string) =>
+      (await dbs.sys(sql<{ status: string }>`select t.status from transfers t join payments p on p.id = t.payment_id where p.booking_id = ${id}`)).rows[0]!.status;
+    expect(await payout(first.id)).toBe('on_hold');
+    expect(await payout(second.id)).toBe('on_hold');
+
+    // The doctor ends the OPD: seen → completed, not come → no-show; both are paid out now.
+    const end = await api().post(`/v1/doctor/sessions/${sessionId}/end`).set(bearer(s.doctorToken)).send({ leftovers: 'move' });
+    expect(end.status).toBeLessThan(300);
+    await payments.releaseDueTransfers();
+    expect(await payout(second.id)).toBe('released');
+    expect(await payout(first.id)).toBe('released');
+  });
+
+  it('doctor forgets END OPD: closed after 3 hours; passed-over = did not come, never reached = pick a new time', async () => {
+    const all = await bookableWindows();
+    const bySession = new Map<string, typeof all>();
+    for (const x of all) bySession.set(x.sessionId, [...(bySession.get(x.sessionId) ?? []), x]);
+    const people = [s.patients[1]!, s.patients[6]!, s.patients[7]!];
+    // A day none of them has booked with this doctor (one booking per doctor per day).
+    const taken = new Set(
+      (await dbs.sys(sql<{ sessionId: string }>`select session_id from bookings where patient_user_id = any(${people.map((p) => p.id)}::uuid[]) and status in ('pending_payment', 'confirmed')`)).rows.map(
+        (r) => r.sessionId,
+      ),
+    );
+    const takenDates = new Set(
+      (await dbs.sys(sql<{ date: string }>`select date from opd_sessions where id = any(${[...taken]}::uuid[])`)).rows.map((r) => String(r.date)),
+    );
+    const dateOf = async (sid: string) => String((await dbs.sys(sql<{ date: string }>`select date from opd_sessions where id = ${sid}`)).rows[0]!.date);
+    let sessionId = '';
+    let ws: typeof all = [];
+    for (const [sid, list] of bySession) {
+      if (list.some((x) => x.free >= 3) && !takenDates.has(await dateOf(sid))) {
+        sessionId = sid;
+        ws = list;
+        break;
+      }
+    }
+    expect(sessionId).not.toBe('');
+    const w = ws.find((x) => x.free >= 3)!;
+    const booked = [];
+    for (const p of people) booked.push((await holdAndPay(p.token, w.id)).verify.booking);
+    booked.sort((x, y) => x.token - y.token);
+    const [a, b, c] = booked;
+    // Yesterday's OPD (so it overlaps nothing), started, and the doctor saw only the middle patient.
+    await dbs.sys(sql`update opd_sessions set starts_at = now() - interval '30 hours', ends_at = now() - interval '28 hours', status = 'running', started_at = now() - interval '30 hours' where id = ${sessionId}`);
+    await dbs.sys(sql`update opd_windows set starts_at = now() - interval '30 hours', ends_at = now() - interval '29 hours' where id = ${w.id}`);
+    await api().post(`/v1/doctor/sessions/${sessionId}/call-now`).set(bearer(s.doctorToken)).send({ bookingId: b!.id }).expect(200);
+    await api().post(`/v1/doctor/sessions/${sessionId}/done`).set(bearer(s.doctorToken)).send({}).expect(200);
+    // The doctor never pressed END OPD. The job closes it.
+    const r = await jobs.autoSessions();
+    expect(r.ended).toBeGreaterThanOrEqual(1);
+    const row = async (id: string) =>
+      (await dbs.sys(sql<{ status: string; moved: boolean }>`select status, needs_new_time_since is not null as moved from bookings where id = ${id}`)).rows[0]!;
+    expect(await row(a!.id)).toMatchObject({ status: 'no_show' }); // passed over
+    expect(await row(b!.id)).toMatchObject({ status: 'completed' }); // seen
+    expect(await row(c!.id)).toMatchObject({ status: 'confirmed', moved: true }); // never reached: picks a new time
   });
 
   it('doctors hear about their work: new bookings, time changes, emergency off, OPD soon, tomorrow; with their own settings', async () => {

@@ -550,9 +550,12 @@ export class PaymentsService {
     if (!this.env.RAZORPAY_ROUTE_ENABLED) return { released: 0, waiting: 0 };
     const due = await this.dbs.sys(sql<{ id: string; amountPaise: number; doctorId: string; razorpayPaymentId: string | null; accountId: string | null; accountStatus: string | null; bookingId: string }>`
       select t.id, t.amount_paise, t.doctor_id, p.razorpay_payment_id, pa.razorpay_account_id as account_id, pa.status as account_status, p.booking_id
-        from transfers t join payments p on p.id = t.payment_id
+        from transfers t join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
         left join payout_accounts pa on pa.doctor_id = t.doctor_id
        where t.status = 'on_hold' and t.release_at <= now()
+         -- Only visits that are over (seen, or did not come). A booking still open — e.g. the patient was asked
+         -- to pick a new time — is never paid out, so a later refund never has to pull money back from the doctor.
+         and b.status in ('completed', 'no_show')
        order by t.release_at limit ${limit}`);
     let released = 0;
     let waiting = 0;

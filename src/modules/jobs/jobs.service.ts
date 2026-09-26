@@ -285,11 +285,27 @@ export class JobsService implements OnApplicationShutdown {
    */
   async autoSessions(): Promise<{ markedNotCome: number; ended: number; neverStarted: number }> {
     const noShowMin = await this.rules.noShowAfterMinutes();
-    const marked = await this.dbs.sys(sql`
+    // Only people the line has already passed: the doctor has called someone AFTER them and their hour is long
+    // over (plus however late the doctor is). A doctor running behind never pushes waiting people out of the line.
+    const marked = await this.dbs.sys(sql<{ bookingId: string; patientUserId: string | null; token: number }>`
       update queue_entries q set state = 'did_not_come'
         from bookings b join opd_windows w on w.id = b.window_id join opd_sessions s on s.id = b.session_id
        where q.booking_id = b.id and q.state = 'not_come' and s.status in ('running', 'paused')
-         and w.ends_at < now() - make_interval(mins => ${noShowMin})`);
+         and w.ends_at < now() - make_interval(mins => ${noShowMin} + s.late_minutes)
+         and exists (select 1 from queue_entries later
+                      where later.session_id = q.session_id and later.state in ('with_doctor', 'done') and later.order_key > q.order_key)
+      returning q.booking_id, b.patient_user_id, b.token`);
+    for (const m of marked.rows) {
+      if (!m.patientUserId) continue;
+      await this.deliverNotify({
+        userId: m.patientUserId,
+        kind: 'turn',
+        title: 'Marked as did not come',
+        body: `Token ${String(m.token).padStart(2, '0')}: the doctor has moved past your turn and you were not there. If you are at the hospital, please tell the reception so you are put back in line.`,
+        bookingId: m.bookingId,
+        dedupeKey: `auto-dnc:${m.bookingId}`,
+      });
+    }
     const stale = await this.dbs.db
       .selectFrom('opdSessions')
       .select(['id', 'status'])
@@ -316,8 +332,13 @@ export class JobsService implements OnApplicationShutdown {
           neverStarted++;
           outcome = 'cancelled';
         } else {
-          await tx.updateTable('queueEntries').set({ state: 'did_not_come' }).where('sessionId', '=', s.id).where('state', '=', 'not_come').execute();
-          await this.live.endSession(tx, locked, 'move', { type: 'system', id: null }, 'The OPD was closed automatically', publishes);
+          // Passed over (the doctor saw someone after them): did not come. Never reached (the doctor stopped
+          // before them): not their fault — endSession asks them to pick a new time (all money back if they don't).
+          await sql`update queue_entries q set state = 'did_not_come'
+                      where q.session_id = ${s.id} and q.state = 'not_come'
+                        and exists (select 1 from queue_entries later where later.session_id = q.session_id
+                                     and later.state in ('with_doctor', 'done') and later.order_key > q.order_key)`.execute(tx);
+          await this.live.endSession(tx, locked, 'move', { type: 'system', id: null }, 'The OPD was closed before your turn', publishes);
           ended++;
           outcome = 'closed';
         }
@@ -325,7 +346,7 @@ export class JobsService implements OnApplicationShutdown {
       for (const p of publishes) this.bus.publish(p);
       if (outcome) await this.tellDoctorAboutSession(s.id, outcome);
     }
-    return { markedNotCome: Number(marked.numAffectedRows ?? 0), ended, neverStarted };
+    return { markedNotCome: marked.rows.length, ended, neverStarted };
   }
 
   async expireEmergency(): Promise<number> {
