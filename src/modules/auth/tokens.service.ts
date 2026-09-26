@@ -40,7 +40,7 @@ export class TokensService {
   async issueApp(tx: Tx, who: { userId: string; role: AppRole; doctorId?: string }, ctx: IssueContext = {}, existingFamily?: string): Promise<TokenPair> {
     const familyId = existingFamily ?? uuidv7();
     // A new sign-in (not a refresh) on a doctor account: at most N devices at a time.
-    if (!existingFamily && who.role === 'doctor') await this.makeRoomForDoctorDevice(tx, who.userId);
+    if (!existingFamily && who.role === 'doctor') await this.makeRoomForDoctorDevice(tx, who.userId, ctx.deviceId ?? null);
     const refreshToken = randomToken();
     await tx
       .insertInto('refreshTokens')
@@ -181,11 +181,17 @@ export class TokensService {
    * A doctor account may be signed in on at most `doctor.max_devices` devices (2). Signing in on one more signs
    * out the device used least recently, so a doctor who lost a phone is never locked out; they are told.
    */
-  private async makeRoomForDoctorDevice(tx: Tx, userId: string): Promise<void> {
+  /**
+   * Phones and the doctor website have separate places: at most N phones (doctor.max_devices, default 2) and
+   * M website sign-ins (doctor.max_web_devices, default 1). A website sign-in never signs out a phone.
+   */
+  private async makeRoomForDoctorDevice(tx: Tx, userId: string, deviceId: string | null): Promise<void> {
     // Two sign-ins at the same moment must not both see "one place free".
     await sql`select pg_advisory_xact_lock(hashtext(${`devices:${userId}`}))`.execute(tx);
-    const max = Math.max(1, await this.rules.doctorMaxDevices());
-    const live = await this.liveSessions(tx, userId, 'doctor');
+    const device = deviceId ? await tx.selectFrom('devices').select('platform').where('id', '=', deviceId).executeTakeFirst() : undefined;
+    const web = device?.platform === 'web';
+    const max = Math.max(1, web ? await this.rules.doctorMaxWebDevices() : await this.rules.doctorMaxDevices());
+    const live = (await this.liveSessions(tx, userId, 'doctor')).filter((x) => (x.platform === 'web') === web);
     const extra = live.length - (max - 1);
     for (const old of live.slice(0, Math.max(0, extra))) {
       await this.revokeFamily(tx, old.familyId);
@@ -193,7 +199,9 @@ export class TokensService {
         userId,
         kind: 'system',
         title: 'Signed out on another device',
-        body: `Your OPflow account can be used on ${max} devices at a time. You signed in on a new device, so ${old.deviceLabel} was signed out.`,
+        body: web
+          ? `OPflow for Doctors can be open in ${max === 1 ? 'one browser' : `${max} browsers`} at a time. You signed in on another computer, so the older one was signed out.`
+          : `Your OPflow account can be used on ${max} devices at a time. You signed in on a new device, so ${old.deviceLabel} was signed out.`,
         dedupeKey: `device-out:${old.familyId}`,
       });
     }

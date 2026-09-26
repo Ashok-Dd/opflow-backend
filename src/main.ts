@@ -29,7 +29,7 @@ async function bootstrap() {
   app.disable('x-powered-by');
   if (env.TRUST_PROXY) app.set('trust proxy', 1);
   // The mobile app is not a browser; CORS is only for the admin site.
-  app.enableCors({ origin: env.CORS_ORIGINS, credentials: true });
+  app.enableCors({ origin: [...env.CORS_ORIGINS, ...(env.DOCTOR_WEB_ORIGIN ? [env.DOCTOR_WEB_ORIGIN] : [])], credentials: true });
   app.enableShutdownHooks(); // finish in-flight requests and close the database pool on deploy/restart
 
   if (env.APP_ENV !== 'production') {

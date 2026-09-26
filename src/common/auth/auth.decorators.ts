@@ -1,3 +1,6 @@
+import { timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
+
 import { createParamDecorator, ExecutionContext, HttpStatus, SetMetadata } from '@nestjs/common';
 import type { Request } from 'express';
 
@@ -66,10 +69,31 @@ export interface RequestMeta {
 }
 export const Meta = createParamDecorator((_: unknown, ctx: ExecutionContext): RequestMeta => {
   const req = ctx.switchToHttp().getRequest<AuthedRequest>();
-  return { ip: clientIp(req), requestId: req.id ?? null, userAgent: req.headers['user-agent']?.slice(0, 300) ?? null };
+  return { ip: clientIp(req), requestId: req.id ?? null, userAgent: clientUserAgent(req) };
 });
 
+/**
+ * True when the request comes from the OPflow doctor website's own server (it knows DOCTOR_WEB_KEY). Only then
+ * are its x-opflow-client-ip / x-opflow-client-ua headers believed; from anyone else they are ignored.
+ */
+function fromDoctorWeb(req: Request): boolean {
+  const key = process.env.DOCTOR_WEB_KEY;
+  const sent = req.headers['x-opflow-web-key'];
+  if (!key || typeof sent !== 'string' || sent.length !== key.length) return false;
+  return timingSafeEqual(Buffer.from(sent), Buffer.from(key));
+}
+
 export function clientIp(req: Request): string | null {
+  if (fromDoctorWeb(req)) {
+    const fwd = req.headers['x-opflow-client-ip'];
+    if (typeof fwd === 'string' && isIP(fwd.trim())) return fwd.trim().replace(/^::ffff:/, '');
+  }
   const ip = req.ip ?? req.socket?.remoteAddress ?? null;
   return ip ? ip.replace(/^::ffff:/, '') : null;
+}
+
+export function clientUserAgent(req: Request): string | null {
+  const fwd = fromDoctorWeb(req) ? req.headers['x-opflow-client-ua'] : undefined;
+  const ua = typeof fwd === 'string' && fwd ? fwd : req.headers['user-agent'];
+  return ua?.slice(0, 300) ?? null;
 }

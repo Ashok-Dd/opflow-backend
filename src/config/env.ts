@@ -36,6 +36,11 @@ export const envSchema = z
       .default('')
       .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean)),
 
+    // The doctor website (OPflow for Doctors): its address, and the secret its server sends so the API can trust
+    // the real browser IP it forwards (rate limits and the sign-in list). Same value in both places.
+    DOCTOR_WEB_ORIGIN: z.string().url().optional(),
+    DOCTOR_WEB_KEY: z.string().min(32, 'must be at least 32 characters').optional(),
+
     // Database (Supabase Postgres, transaction pooler, as opflow_api)
     DATABASE_URL: postgresUrl,
     DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),

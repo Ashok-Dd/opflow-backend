@@ -61,6 +61,8 @@ export class RulesService {
   noShowAfterMinutes = () => this.num('no_show_after_minutes', 60);
   movePickHours = () => this.num('move_pick_hours', 48);
   doctorMaxDevices = () => this.num('doctor.max_devices', 2);
+  /** Sign-ins on the doctor website, counted apart from phones. */
+  doctorMaxWebDevices = () => this.num('doctor.max_web_devices', 1);
   minAppVersion = () => this.text('min_supported_app_version', '1.0.0');
   latestAppVersion = () => this.text('latest_app_version', '1.0.0');
   maintenanceMessage = () => this.text('maintenance.message', null);

@@ -264,6 +264,43 @@ run('OPflow end to end', () => {
     s.doctorRefresh = phone3.refreshToken;
   });
 
+  it('the doctor website has its own place: it never signs out a phone; a second browser replaces the first', async () => {
+    const key = 'k'.repeat(40);
+    process.env.DOCTOR_WEB_KEY = key;
+    const phone = (await api().post('/v1/auth/doctor/login').send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'android', fcmToken: `doctor-device-w-${randomUUID()}` } }).expect(200)).body;
+    // Two phones now (phone3 from the test above + this one). The website signs in: both phones keep working.
+    const web = (ip: string, sentKey = key) =>
+      api()
+        .post('/v1/auth/doctor/login')
+        .set('x-opflow-web-key', sentKey)
+        .set('x-opflow-client-ip', ip)
+        .set('x-opflow-client-ua', 'Mozilla/5.0 (Windows NT 10.0) Chrome/130')
+        .send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'web', appVersion: 'web' } })
+        .expect(200);
+    const web1 = (await web('203.0.113.7')).body;
+    await api().get('/v1/doctor/me').set(bearer(s.doctorToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(phone.accessToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(web1.accessToken)).expect(200);
+    // The real browser address and browser are kept (not the website server's), because the key matched.
+    const newest = async () =>
+      (await dbs.sys(sql<{ ip: string; ua: string }>`select host(ip) as ip, user_agent as ua from refresh_tokens
+                                                       where user_id = (select user_id from doctors where id = ${s.doctorId}) order by created_at desc limit 1`)).rows[0]!;
+    expect(await newest()).toMatchObject({ ip: '203.0.113.7', ua: expect.stringContaining('Chrome') });
+    // A second computer: the first browser is signed out; the phones still are not.
+    const web2 = (await web('203.0.113.8')).body;
+    await api().get('/v1/doctor/me').set(bearer(web1.accessToken)).expect(401);
+    await api().get('/v1/doctor/me').set(bearer(web2.accessToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(s.doctorToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(phone.accessToken)).expect(200);
+    const list = await api().get('/v1/doctor/devices').set(bearer(web2.accessToken)).expect(200);
+    expect(list.body.maxWeb).toBe(1);
+    expect(list.body.items.filter((d: { platform: string }) => d.platform === 'web')).toHaveLength(1);
+    // Without the right key, a forwarded address is ignored (nobody can fake their IP).
+    await web('198.51.100.9', 'x'.repeat(40));
+    expect((await newest()).ip).not.toBe('198.51.100.9');
+    delete process.env.DOCTOR_WEB_KEY;
+  });
+
   it('patients see the doctor card (without the registration number) and free hours', async () => {
     const list = await api().get('/v1/doctors').query({ type: 'general', near: '16.30,80.44' }).expect(200);
     const card = list.body.items.find((d: { id: string }) => d.id === s.doctorId);

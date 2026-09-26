@@ -482,9 +482,11 @@ export class DoctorService {
   /** Devices this doctor account is signed in on (at most 2), newest first. */
   async devices(d: DoctorIdentity, currentSid: string) {
     const max = await this.rules.doctorMaxDevices();
+    const maxWeb = await this.rules.doctorMaxWebDevices();
     const rows = await this.dbs.system((tx) => this.tokens.liveSessions(tx, d.userId, 'doctor'));
     return {
       max,
+      maxWeb,
       items: rows.reverse().map((r) => ({
         id: r.familyId,
         thisDevice: r.familyId === currentSid,
