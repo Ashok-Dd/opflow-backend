@@ -75,9 +75,12 @@ export class RateLimitGuard implements CanActivate {
     const req = ctx.switchToHttp().getRequest<AuthedRequest>();
     const specific = this.reflector.getAllAndOverride<LimitRule | undefined>(RATE_LIMIT, [ctx.getHandler(), ctx.getClass()]);
     const who = req.principal ? (req.principal.kind === 'admin' ? `a:${req.principal.adminId}` : `u:${req.principal.userId}`) : undefined;
+    // The general limit counts per signed-in device (session), so a doctor's desk website and phone each have their
+    // own budget and one can never block the other. Specific limits (payments, sign-in…) stay per person.
+    const session = req.principal ? `${who}:${req.principal.sid}` : undefined;
     const rules = specific ? [specific] : [who ? DEFAULT_USER : DEFAULT_IP];
     for (const rule of rules) {
-      const id = rule.by === 'user' && who ? who : `ip:${clientIp(req) ?? 'unknown'}`;
+      const id = rule.by === 'user' && who ? (specific ? who : session!) : `ip:${clientIp(req) ?? 'unknown'}`;
       await this.limiter.check(`${rule.name}:${id}`, rule.limit, rule.windowSeconds);
     }
     return true;

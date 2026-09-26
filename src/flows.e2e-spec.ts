@@ -641,8 +641,11 @@ run('OPflow end to end', () => {
   it('refresh tokens rotate; reusing an old one ends the whole session', async () => {
     const p = s.patients[7]!;
     await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(200);
-    // The phone never got that answer (weak signal) and tries again with the old token: the new token was never
-    // used, so this is a lost reply, not theft. A fresh pair; the unused one is cancelled.
+    // Two requests at the same moment (a website page and its background check): refused quietly, nothing ended.
+    await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(401);
+    // The phone never got that answer (weak signal) and tries again seconds later with the old token: the new token
+    // was never used, so this is a lost reply, not theft. A fresh pair; the unused one is cancelled.
+    await dbs.system((tx) => sql`update refresh_tokens set revoked_at = now() - interval '10 seconds' where replaced_by is not null and user_id = ${p.id}`.execute(tx));
     const r2 = await api().post('/v1/auth/refresh').send({ refreshToken: p.refresh }).expect(200);
     const r3 = await api().post('/v1/auth/refresh').send({ refreshToken: r2.body.refreshToken }).expect(200);
     // Now the old token again, a minute later, after its successor was used: a copy. The whole session ends.

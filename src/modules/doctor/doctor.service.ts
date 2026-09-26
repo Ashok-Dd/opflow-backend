@@ -191,6 +191,32 @@ export class DoctorService {
     });
   }
 
+  /** Per day: patients still coming (paid, not moved) and all bookings (not cancelled), at every hospital. */
+  async bookingCounts(d: DoctorIdentity, from: string, days: number) {
+    const to = addDays(from, days - 1);
+    const rows = await this.dbs.as(as(d), async (tx) =>
+      (
+        await sql<{ date: string; coming: number; total: number }>`
+          select b.session_date as date,
+                 count(*) filter (where b.status = 'confirmed' and b.needs_new_time_since is null)::int as coming,
+                 count(*) filter (where b.status <> 'cancelled_by_provider')::int as total
+            from bookings b
+           where b.doctor_id = ${d.doctorId} and b.session_date between ${from}::date and ${to}::date
+             and b.status in ('confirmed', 'completed', 'no_show', 'cancelled_by_provider')
+           group by b.session_date`.execute(tx)
+      ).rows,
+    );
+    const by = new Map(rows.map((r) => [String(r.date), r]));
+    return {
+      from,
+      days: Array.from({ length: days }, (_, i) => {
+        const date = addDays(from, i);
+        const r = by.get(date);
+        return { date, coming: r?.coming ?? 0, total: r?.total ?? 0 };
+      }),
+    };
+  }
+
   async booking(d: DoctorIdentity, id: string) {
     return this.dbs.as(as(d), async (tx) => {
       const b = await tx

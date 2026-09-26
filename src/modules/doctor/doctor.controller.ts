@@ -123,6 +123,12 @@ export class DoctorController {
     return this.doctors.bookingsOn(d, q.date, q.hospital, q.filter);
   }
 
+  /** How many patients are booked on each of the next days (the day strip and the leave calendar, in one call). */
+  @Get('bookings/counts')
+  counts(@CurrentDoctor() d: DoctorIdentity, @ZQuery(z.object({ from: zDate, days: z.coerce.number().int().min(1).max(62).default(14) })) q: { from: string; days: number }) {
+    return this.doctors.bookingCounts(d, q.from, q.days);
+  }
+
   @Get('bookings/:id')
   booking(@CurrentDoctor() d: DoctorIdentity, @IdParam() id: string) {
     return this.doctors.booking(d, id);

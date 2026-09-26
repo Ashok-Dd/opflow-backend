@@ -104,7 +104,10 @@ export class TokensService {
       // with the old token. If the token it was swapped for has never been used (and it's within 2 minutes), that
       // is a lost reply, not theft: cancel the unused one and issue a fresh pair.
       let lostReply = false;
-      if (audience === 'app' && row.replacedBy && row.revokedAt && Date.now() - new Date(row.revokedAt).getTime() < 120_000) {
+      // Not for a repeat within 5 seconds: that is two requests refreshing at the same moment (a website's page and
+      // its background check), handled below without ending or cancelling anything.
+      const since = row.revokedAt ? Date.now() - new Date(row.revokedAt).getTime() : Infinity;
+      if (audience === 'app' && row.replacedBy && since >= 5_000 && since < 120_000) {
         const successor = await tx.selectFrom('refreshTokens').select(['id', 'revokedAt', 'replacedBy']).where('id', '=', row.replacedBy).forUpdate().executeTakeFirst();
         if (successor && !successor.revokedAt && !successor.replacedBy) {
           await tx.updateTable('refreshTokens').set({ revokedAt: new Date() }).where('id', '=', successor.id).execute();
