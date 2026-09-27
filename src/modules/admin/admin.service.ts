@@ -25,7 +25,7 @@ import { ChangesService } from './changes.service';
 const as = (who: AdminPrincipal) => ({ role: 'admin' as const, adminId: who.adminId });
 
 /** Switches that stop a feature for everyone at once (e.g. bookings during a payment outage). */
-export const KILL_SWITCHES = ['bookings.enabled', 'emergency.enabled', 'emergency_consult.enabled', 'push.turn_alerts'];
+export const KILL_SWITCHES = ['bookings.enabled', 'emergency.enabled', 'emergency_consult.enabled', 'push.turn_alerts', 'picks.enabled'];
 
 export interface HospitalInput {
   slug?: string;
@@ -648,6 +648,16 @@ export class AdminService {
       const row = await tx.selectFrom('appConfig').select(['value']).where('key', '=', key).executeTakeFirst();
       if (!row) throw new AppError('NOT_FOUND', 'There is no such rule.', HttpStatus.NOT_FOUND);
       if (typeof value !== typeof row.value && row.value !== null) throw new AppError('INVALID_INPUT', 'This value has the wrong type.', HttpStatus.BAD_REQUEST);
+      // "Find Your Right Doctor": a sensible price (₹1–₹1,000) and distance (1–100 km); some text for "How we recommend".
+      if (key === 'picks.price_paise' && !(Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 100_000)) {
+        throw new AppError('INVALID_INPUT', 'The price must be in paise, between 100 (₹1) and 100000 (₹1,000).', HttpStatus.BAD_REQUEST);
+      }
+      if (key === 'picks.max_km' && !(Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 100)) {
+        throw new AppError('INVALID_INPUT', 'The distance must be between 1 and 100 km.', HttpStatus.BAD_REQUEST);
+      }
+      if (key === 'picks.criteria' && !(typeof value === 'string' && value.trim().length >= 40 && value.length <= 600)) {
+        throw new AppError('INVALID_INPUT', 'Please write how OPflow recommends in 40 to 600 letters.', HttpStatus.BAD_REQUEST);
+      }
       if (key === 'platform_fee_percent') throw new AppError('LOCKED_RULE', 'The 10% fee is fixed in the database and changed only by a migration.', HttpStatus.UNPROCESSABLE_ENTITY);
       await this.changes.apply(tx, who, { type: 'app_config', id: key }, { kind: 'config_change', key, value }, reason, meta);
       return { ok: true, key, value, message: 'Saved. Every server follows within about 15 seconds.' };
