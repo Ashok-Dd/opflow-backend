@@ -56,18 +56,24 @@ services:
       # Patient login codes: shown on the app's code screen until the MSG91 OTP template is set (test server only).
       - key: PHONE_LOGIN
         value: sms
-      # Push notifications (Firebase service account) and Razorpay TEST keys. Values: backend/.env.render.
+      # Push notifications (Firebase service account) and Cashfree keys (sandbox first). Values: backend/.env.render.
       - key: FIREBASE_PROJECT_ID
         sync: false
       - key: FIREBASE_CLIENT_EMAIL
         sync: false
       - key: FIREBASE_PRIVATE_KEY_B64
         sync: false
-      - key: RAZORPAY_KEY_ID
+      - key: CASHFREE_ENV
+        value: sandbox
+      - key: CASHFREE_CLIENT_ID
         sync: false
-      - key: RAZORPAY_KEY_SECRET
+      - key: CASHFREE_CLIENT_SECRET
         sync: false
-      - key: RAZORPAY_WEBHOOK_SECRET
+      - key: CASHFREE_PAYOUT_CLIENT_ID
+        sync: false
+      - key: CASHFREE_PAYOUT_CLIENT_SECRET
+        sync: false
+      - key: CASHFREE_PAYOUT_PUBLIC_KEY_B64
         sync: false
       - key: STORAGE_PROVIDER
         value: local

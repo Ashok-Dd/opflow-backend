@@ -5,7 +5,8 @@ import { allowsStandIns, ENV, Env, isLocal, phoneLogin } from '../config/env';
 import { LiveBus } from './bus/live-bus';
 import { ClosedPhoneVerifier, DevPhoneVerifier, FirebasePhoneVerifier, PHONE_VERIFIER, PhoneVerifier } from './firebase/phone-verifier';
 import { EMAIL, EmailSender, FcmPush, LogEmail, LogOtp, LogPush, LogSms, Msg91Otp, Msg91Sms, OTP_SENDER, OtpSender, PUSH, PushSender, ResendEmail, SMS } from './messaging/messaging';
-import { FakeRazorpayGateway, PAYMENT_GATEWAY, PaymentGateway, RazorpayGateway } from './payments/gateway';
+import { CashfreeGateway, FakeCashfreeGateway, PAYMENT_GATEWAY, PaymentGateway } from './payments/gateway';
+import { CashfreePayouts, FakePayouts, PAYOUTS, PayoutsProvider } from './payments/payouts';
 import { RateLimiter } from './redis/rate-limit';
 import { RedisService } from './redis/redis.service';
 import { RulesService } from './rules/rules.service';
@@ -34,8 +35,15 @@ function pick<T>(name: string, configured: boolean, env: Env, real: () => T, sta
       provide: PAYMENT_GATEWAY,
       inject: [ENV],
       useFactory: (env: Env): PaymentGateway =>
-        pick<PaymentGateway>('Razorpay', !!(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET && env.RAZORPAY_WEBHOOK_SECRET), env,
-          () => new RazorpayGateway(env), () => new FakeRazorpayGateway()),
+        pick<PaymentGateway>('Cashfree Payment Gateway', !!(env.CASHFREE_CLIENT_ID && env.CASHFREE_CLIENT_SECRET), env,
+          () => new CashfreeGateway(env), () => new FakeCashfreeGateway()),
+    },
+    {
+      provide: PAYOUTS,
+      inject: [ENV],
+      useFactory: (env: Env): PayoutsProvider =>
+        pick<PayoutsProvider>('Cashfree Payouts', !!(env.CASHFREE_PAYOUT_CLIENT_ID && env.CASHFREE_PAYOUT_CLIENT_SECRET && env.CASHFREE_PAYOUT_PUBLIC_KEY_B64), env,
+          () => new CashfreePayouts(env), () => new FakePayouts()),
     },
     {
       provide: STORAGE,
@@ -83,6 +91,6 @@ function pick<T>(name: string, configured: boolean, env: Env, real: () => T, sta
       useFactory: (env: Env) => (env.MSG91_AUTH_KEY && env.MSG91_SMS_TEMPLATE_ID ? new Msg91Sms(env) : new LogSms(isLocal(env))),
     },
   ],
-  exports: [RedisService, RateLimiter, LiveBus, RulesService, JwtService, PAYMENT_GATEWAY, STORAGE, PHONE_VERIFIER, OTP_SENDER, PUSH, EMAIL, SMS],
+  exports: [RedisService, RateLimiter, LiveBus, RulesService, JwtService, PAYMENT_GATEWAY, PAYOUTS, STORAGE, PHONE_VERIFIER, OTP_SENDER, PUSH, EMAIL, SMS],
 })
 export class InfraModule {}

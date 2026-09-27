@@ -466,10 +466,12 @@ export class DoctorService {
       select b.session_date as date, count(*)::int as patients,
              sum(b.fee_paise)::int as fee, sum(b.platform_fee_paise)::int as platform,
              sum(t.amount_paise)::int as share,
-             coalesce(sum(t.amount_paise) filter (where t.status = 'released'), 0)::int as in_bank,
-             coalesce(sum(t.amount_paise) filter (where t.status = 'on_hold'), 0)::int as coming,
+             -- In the bank = its payout reached the bank; coming = on hold, or in a payout still on its way.
+             coalesce(sum(t.amount_paise) filter (where t.status = 'released' and po.status = 'success'), 0)::int as in_bank,
+             coalesce(sum(t.amount_paise) filter (where t.status = 'on_hold' or (t.status = 'released' and po.status is distinct from 'success')), 0)::int as coming,
              coalesce(sum(t.amount_paise) filter (where t.status = 'reversed'), 0)::int as back
         from transfers t join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
+        left join payouts po on po.id = t.payout_id
        where t.doctor_id = ${d.doctorId} and b.session_date >= ${from}::date
        group by b.session_date order by b.session_date desc`);
     const sum = (k: 'share' | 'inBank' | 'coming' | 'back' | 'patients') => rows.rows.reduce((a, r) => a + r[k], 0);
@@ -486,6 +488,29 @@ export class DoctorService {
         inBank: money(r.inBank),
         coming: money(r.coming),
         moneyBack: money(r.back),
+      })),
+    };
+  }
+
+  /** Bank payouts to this doctor (one per run, covering many visits), newest first. */
+  async payouts(d: DoctorIdentity, limit = 30) {
+    const rows = await this.dbs.sys(sql<{ id: string; amountPaise: number; visitsPaise: number; deductedPaise: number; status: string; utr: string | null; createdAt: Date; settledAt: Date | null; visits: number }>`
+      select po.id, po.amount_paise, po.visits_paise, po.deducted_paise, po.status, po.utr, po.created_at, po.settled_at,
+             (select count(*)::int from transfers t where t.payout_id = po.id) as visits
+        from payouts po where po.doctor_id = ${d.doctorId} order by po.created_at desc limit ${limit}`);
+    const acc = await this.dbs.sys(sql<{ bankLast4: string | null; status: string }>`select bank_last4, status from payout_accounts where doctor_id = ${d.doctorId}`);
+    return {
+      bank: acc.rows[0] ? { last4: acc.rows[0].bankLast4, active: acc.rows[0].status === 'active' } : null,
+      items: rows.rows.map((r) => ({
+        id: r.id,
+        amount: money(r.amountPaise),
+        visits: r.visits,
+        deducted: r.deductedPaise ? money(r.deductedPaise) : null,
+        // "failed" never reached the doctor: those visits are paid again in a later payout.
+        status: r.status as 'pending' | 'success' | 'failed',
+        bankReference: r.utr,
+        createdAt: r.createdAt,
+        settledAt: r.settledAt,
       })),
     };
   }

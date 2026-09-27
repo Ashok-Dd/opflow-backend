@@ -100,7 +100,7 @@ export class AdminService {
 
   /** One list of everything a person must look at. */
   async attention() {
-    const [refunds, bulk, doctors, docs, tickets, holdsStuck, transfers, webhooks] = await Promise.all([
+    const [refunds, bulk, doctors, docs, tickets, holdsStuck, transfers, webhooks, payouts] = await Promise.all([
       this.dbs.sys(sql`select r.id, r.amount_paise, r.attempts, r.failure_reason, r.updated_at, p.booking_id from refunds r join payments p on p.id = r.payment_id
            where r.status = 'failed' and (r.attempts >= 3 or r.next_attempt_at is null) order by r.updated_at desc limit 50`),
       this.dbs.sys(sql`select id, doctor_id, kind, done, failed, total, updated_at from bulk_operations
@@ -112,6 +112,10 @@ export class AdminService {
       this.dbs.sys(sql`select t.id, t.doctor_id, t.amount_paise, t.release_at from transfers t left join payout_accounts pa on pa.doctor_id = t.doctor_id
            where t.status in ('on_hold', 'failed') and t.release_at < now() - interval '2 hours' and (pa.status is distinct from 'active' or t.status = 'failed') limit 50`),
       this.dbs.sys(sql`select id, type, error, received_at from webhook_events where processed_at is null and received_at < now() - interval '10 minutes' limit 50`),
+      // Bank payouts the bank refused (last 14 days), or still not settled after a day.
+      this.dbs.sys(sql`select po.id, po.doctor_id, d.name as doctor, po.amount_paise, po.status, po.failure_reason, po.created_at from payouts po join doctors d on d.id = po.doctor_id
+           where (po.status = 'failed' and po.settled_at > now() - interval '14 days') or (po.status = 'pending' and po.created_at < now() - interval '1 day')
+           order by po.created_at desc limit 50`),
     ]);
     const idle = await this.dbs.sys(sql`select s.id, s.doctor_id, d.name, s.updated_at from opd_sessions s join doctors d on d.id = s.doctor_id
                             where s.status in ('running', 'paused') and s.updated_at < now() - interval '45 minutes'`);
@@ -124,6 +128,7 @@ export class AdminService {
       holdsNotExpired: (holdsStuck.rows[0] as { n: number }).n,
       payoutsWaiting: transfers.rows,
       unprocessedWebhooks: webhooks.rows,
+      payoutProblems: payouts.rows,
       idleOpds: idle.rows,
     };
   }
@@ -231,17 +236,17 @@ export class AdminService {
       const b = rows[0];
       if (!b) throw new AppError('BOOKING_NOT_FOUND', 'We could not find this booking.', HttpStatus.NOT_FOUND);
       const events = await tx.selectFrom('bookingEvents').select(['type', 'actorType', 'actorId', 'data', 'at']).where('bookingId', '=', id).orderBy('at').orderBy('id').execute();
-      const payments = await tx.selectFrom('payments').select(['id', 'razorpayOrderId', 'razorpayPaymentId', 'amountPaise', 'status', 'method', 'failureReason', 'abandoned', 'createdAt']).where('bookingId', '=', id).execute();
+      const payments = await tx.selectFrom('payments').select(['id', 'gatewayOrderId', 'gatewayPaymentId', 'amountPaise', 'status', 'method', 'failureReason', 'abandoned', 'createdAt']).where('bookingId', '=', id).execute();
       const refunds = await tx
         .selectFrom('refunds as r')
         .innerJoin('payments as p', 'p.id', 'r.paymentId')
-        .select(['r.id', 'r.amountPaise', 'r.reason', 'r.status', 'r.attempts', 'r.razorpayRefundId', 'r.failureReason', 'r.manualReference', 'r.createdAt'])
+        .select(['r.id', 'r.amountPaise', 'r.reason', 'r.status', 'r.attempts', 'r.gatewayRefundId', 'r.failureReason', 'r.manualReference', 'r.createdAt'])
         .where('p.bookingId', '=', id)
         .execute();
       const transfers = await tx
         .selectFrom('transfers as t')
         .innerJoin('payments as p', 'p.id', 't.paymentId')
-        .select(['t.id', 't.amountPaise', 't.status', 't.releaseAt', 't.releasedAt', 't.reversedAt', 't.razorpayTransferId'])
+        .select(['t.id', 't.amountPaise', 't.status', 't.releaseAt', 't.releasedAt', 't.reversedAt', 't.payoutId', 't.recoverPaise'])
         .where('p.bookingId', '=', id)
         .execute();
       const queue = await tx.selectFrom('queueEvents').select(['version', 'type', 'at', 'actorId']).where('bookingId', '=', id).orderBy('version').execute();
@@ -331,7 +336,7 @@ export class AdminService {
 
   paymentsList(f: { status?: string; method?: string; from?: string; to?: string; limit: number; offset: number }) {
     return this.dbs.sys(sql`
-      select p.id, p.booking_id, b.code, p.razorpay_order_id, p.razorpay_payment_id, p.amount_paise, p.status, p.method, p.failure_reason, p.created_at
+      select p.id, p.booking_id, b.code, p.gateway_order_id, p.gateway_payment_id, p.amount_paise, p.status, p.method, p.failure_reason, p.created_at
         from payments p join bookings b on b.id = p.booking_id
        where (${f.status ?? null}::text is null or p.status::text = ${f.status ?? null}::text)
          and (${f.method ?? null}::text is null or p.method = ${f.method ?? null}::text)
@@ -342,7 +347,7 @@ export class AdminService {
 
   refunds(status: string | undefined, limit: number, offset: number) {
     return this.dbs.sys(sql`
-      select r.id, r.amount_paise, r.reason, r.status, r.attempts, r.failure_reason, r.next_attempt_at, r.razorpay_refund_id, r.manual_reference,
+      select r.id, r.amount_paise, r.reason, r.status, r.attempts, r.failure_reason, r.next_attempt_at, r.gateway_refund_id, r.manual_reference,
              r.created_at, b.id as booking_id, b.code, b.patient_name
         from refunds r join payments p on p.id = r.payment_id join bookings b on b.id = p.booking_id
        where (${status ?? null}::text is null or r.status::text = ${status ?? null}::text)
@@ -373,11 +378,32 @@ export class AdminService {
 
   transfers(status: string | undefined, doctorId: string | undefined, limit: number, offset: number) {
     return this.dbs.sys(sql`
-      select t.id, t.doctor_id, d.name as doctor, t.amount_paise, t.status, t.release_at, t.released_at, t.reversed_at, t.razorpay_transfer_id, b.code
+      select t.id, t.doctor_id, d.name as doctor, t.amount_paise, t.status, t.release_at, t.released_at, t.reversed_at, t.payout_id,
+             po.status as payout_status, t.recover_paise, b.code
         from transfers t join doctors d on d.id = t.doctor_id join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
+        left join payouts po on po.id = t.payout_id
        where (${status ?? null}::text is null or t.status::text = ${status ?? null}::text)
          and (${doctorId ?? null}::uuid is null or t.doctor_id = ${doctorId ?? null}::uuid)
        order by t.release_at desc limit ${limit} offset ${offset}`).then((r) => r.rows);
+  }
+
+  /** Bank payouts to doctors (Cashfree Payouts): one per doctor per run, newest first. */
+  payoutsList(status: string | undefined, doctorId: string | undefined, limit: number, offset: number) {
+    return this.dbs.sys(sql`
+      select po.id, po.doctor_id, d.name as doctor, po.amount_paise, po.visits_paise, po.deducted_paise, po.status, po.utr,
+             po.failure_reason, po.created_at, po.settled_at, a.bank_last4,
+             (select count(*)::int from transfers t where t.payout_id = po.id) as visits
+        from payouts po join doctors d on d.id = po.doctor_id left join payout_accounts a on a.doctor_id = po.doctor_id
+       where (${status ?? null}::text is null or po.status = ${status ?? null}::text)
+         and (${doctorId ?? null}::uuid is null or po.doctor_id = ${doctorId ?? null}::uuid)
+       order by po.created_at desc limit ${limit} offset ${offset}`).then((r) => r.rows);
+  }
+
+  /** "Pay doctors now": runs the payout job at once (it only pays what is due, exactly as the hourly run). */
+  async runPayouts(who: AdminPrincipal, meta: RequestMeta) {
+    const r = await this.payments.releaseDueTransfers();
+    await this.dbs.as(as(who), (tx) => audit(tx, { actorType: 'admin', actorId: who.adminId, action: 'payouts.run', entity: 'payouts', entityId: null, after: r, meta }));
+    return r;
   }
 
   /** Daily money check: captured − refunded − doctor transfers = OPflow's share, and every rule holds. */
@@ -409,16 +435,19 @@ export class AdminService {
   }
 
   /** CSV exports for finance. */
-  async exportCsv(kind: 'payments' | 'refunds' | 'transfers', from: string, to: string): Promise<string> {
+  async exportCsv(kind: 'payments' | 'refunds' | 'transfers' | 'payouts', from: string, to: string): Promise<string> {
     const q =
       kind === 'payments'
-        ? sql`select p.created_at, b.code, p.razorpay_order_id, p.razorpay_payment_id, p.amount_paise, p.status, p.method from payments p join bookings b on b.id = p.booking_id
+        ? sql`select p.created_at, b.code, p.gateway_order_id, p.gateway_payment_id, p.amount_paise, p.status, p.method from payments p join bookings b on b.id = p.booking_id
                where p.created_at >= ${from}::date - interval '5 hours 30 minutes' and p.created_at < ${to}::date + interval '18 hours 30 minutes' order by p.created_at`
         : kind === 'refunds'
-          ? sql`select r.created_at, b.code, r.amount_paise, r.reason, r.status, r.razorpay_refund_id, r.manual_reference from refunds r join payments p on p.id = r.payment_id join bookings b on b.id = p.booking_id
+          ? sql`select r.created_at, b.code, r.amount_paise, r.reason, r.status, r.gateway_refund_id, r.manual_reference from refunds r join payments p on p.id = r.payment_id join bookings b on b.id = p.booking_id
                  where r.created_at >= ${from}::date - interval '5 hours 30 minutes' and r.created_at < ${to}::date + interval '18 hours 30 minutes' order by r.created_at`
-          : sql`select t.release_at, d.name as doctor, b.code, t.amount_paise, t.status, t.razorpay_transfer_id from transfers t join doctors d on d.id = t.doctor_id join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
-                 where t.release_at >= ${from}::date - interval '5 hours 30 minutes' and t.release_at < ${to}::date + interval '18 hours 30 minutes' order by t.release_at`;
+          : kind === 'transfers'
+            ? sql`select t.release_at, d.name as doctor, b.code, t.amount_paise, t.status, t.payout_id, t.recover_paise from transfers t join doctors d on d.id = t.doctor_id join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
+                   where t.release_at >= ${from}::date - interval '5 hours 30 minutes' and t.release_at < ${to}::date + interval '18 hours 30 minutes' order by t.release_at`
+            : sql`select po.created_at, d.name as doctor, po.amount_paise, po.visits_paise, po.deducted_paise, po.status, po.utr, po.settled_at from payouts po join doctors d on d.id = po.doctor_id
+                   where po.created_at >= ${from}::date - interval '5 hours 30 minutes' and po.created_at < ${to}::date + interval '18 hours 30 minutes' order by po.created_at`;
     const rows = (await this.dbs.sys(q)).rows as Record<string, unknown>[];
     const esc = (v: unknown) => {
       const s = v instanceof Date ? v.toISOString() : v === null || v === undefined ? '' : String(v);
@@ -651,6 +680,9 @@ export class AdminService {
       // "Find Your Right Doctor": a sensible price (₹1–₹1,000) and distance (1–100 km); some text for "How we recommend".
       if (key === 'picks.price_paise' && !(Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 100_000)) {
         throw new AppError('INVALID_INPUT', 'The price must be in paise, between 100 (₹1) and 100000 (₹1,000).', HttpStatus.BAD_REQUEST);
+      }
+      if (key === 'payouts.min_paise' && !(Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 500_000)) {
+        throw new AppError('INVALID_INPUT', 'The smallest payout must be in paise, between 100 (₹1) and 500000 (₹5,000).', HttpStatus.BAD_REQUEST);
       }
       if (key === 'picks.max_km' && !(Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 100)) {
         throw new AppError('INVALID_INPUT', 'The distance must be between 1 and 100 km.', HttpStatus.BAD_REQUEST);

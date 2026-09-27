@@ -4,7 +4,7 @@ import type { NotificationKind } from '../infra/db/schema';
 import type { Tx } from '../infra/db/db.service';
 
 /**
- * Side effects (push, email, SMS, refunds at Razorpay, live updates, photo processing) are never done inside
+ * Side effects (push, email, SMS, refunds at Cashfree, live updates, photo processing) are never done inside
  * a request. The request writes an `outbox` row in the SAME transaction as the data change; the worker
  * delivers it and retries on failure. So "money taken but booking not saved" or "patient told but nothing
  * changed" cannot happen.
@@ -12,7 +12,6 @@ import type { Tx } from '../infra/db/db.service';
 export type OutboxMessage =
   | { topic: 'notify'; payload: NotifyPayload }
   | { topic: 'refund.start'; payload: { refundId: string } }
-  | { topic: 'transfer.reverse'; payload: { transferId: string } }
   | { topic: 'live.publish'; payload: { sessionId: string } }
   | { topic: 'photo.process'; payload: { doctorId: string; uploadKey: string } }
   | { topic: 'bulk.cancel'; payload: { bulkId: string; bookingId: string; reason: string; actorId: string | null } }

@@ -506,8 +506,8 @@ export interface Payments {
   id: Generated<string>;
   method: string | null;
   raw: Json | null;
-  razorpayOrderId: string;
-  razorpayPaymentId: string | null;
+  gatewayOrderId: string;
+  gatewayPaymentId: string | null;
   status: Generated<PaymentStatus>;
   updatedAt: Generated<Timestamp>;
 }
@@ -517,7 +517,7 @@ export interface PayoutAccounts {
   createdAt: Generated<Timestamp>;
   doctorId: string;
   ifsc: string | null;
-  razorpayAccountId: string | null;
+  beneficiaryId: string | null;
   status: Generated<PayoutStatus>;
   updatedAt: Generated<Timestamp>;
 }
@@ -567,6 +567,21 @@ export interface RefreshTokens {
   userId: string | null;
 }
 
+export interface Payouts {
+  amountPaise: number;
+  cfTransferId: string | null;
+  createdAt: Generated<Timestamp>;
+  deductedPaise: Generated<number>;
+  doctorId: string;
+  failureReason: string | null;
+  id: Generated<string>;
+  settledAt: Timestamp | null;
+  status: Generated<'pending' | 'success' | 'failed'>;
+  updatedAt: Generated<Timestamp>;
+  utr: string | null;
+  visitsPaise: number;
+}
+
 export interface Refunds {
   amountPaise: number;
   approvedBy: string | null;
@@ -579,7 +594,7 @@ export interface Refunds {
   manualReference: string | null;
   nextAttemptAt: Timestamp | null;
   paymentId: string;
-  razorpayRefundId: string | null;
+  gatewayRefundId: string | null;
   reason: RefundReason;
   status: Generated<RefundStatus>;
   updatedAt: Generated<Timestamp>;
@@ -623,7 +638,9 @@ export interface Transfers {
   doctorId: string;
   id: Generated<string>;
   paymentId: string;
-  razorpayTransferId: string | null;
+  payoutId: string | null;
+  recoveredIn: string | null;
+  recoverPaise: Generated<number>;
   releaseAt: Timestamp;
   releasedAt: Timestamp | null;
   reversedAt: Timestamp | null;
@@ -689,8 +706,8 @@ export interface PickPurchases {
   paidAt: Timestamp | null;
   patientUserId: string;
   place: string | null;
-  razorpayOrderId: string;
-  razorpayPaymentId: string | null;
+  gatewayOrderId: string;
+  gatewayPaymentId: string | null;
   refundId: string | null;
   refundReason: string | null;
   refundedAt: Timestamp | null;
@@ -744,6 +761,7 @@ export interface DB {
   pickPurchases: PickPurchases;
   payments: Payments;
   payoutAccounts: PayoutAccounts;
+  payouts: Payouts;
   phoneOtps: PhoneOtps;
   doctorPicks: DoctorPicks;
   visitFeedback: VisitFeedback;

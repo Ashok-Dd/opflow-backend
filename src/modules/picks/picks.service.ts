@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { HttpStatus, Inject, Injectable, Logger } from '@nestjs/common';
 import { sql } from 'kysely';
 
@@ -8,7 +10,9 @@ import { isUniqueViolation } from '../../common/errors/pg-errors';
 import { money } from '../../common/money';
 import { maskContact } from '../../infra/messaging/messaging';
 import { DbService, Tx } from '../../infra/db/db.service';
-import { GatewayPayment, PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { ENV, type Env } from '../../config/env';
+import { cashfreeId, GatewayPayment, PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { checkoutFor, openGatewayOrder } from '../payments/orders';
 import { RulesService } from '../../infra/rules/rules.service';
 import { DirectoryService } from '../directory/directory.service';
 
@@ -62,6 +66,7 @@ export class PicksService {
     private readonly rules: RulesService,
     private readonly dir: DirectoryService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(ENV) private readonly env: Env,
   ) {}
 
   // ── Choosing the doctors ─────────────────────────────────────────────────────────────────────────
@@ -118,8 +123,8 @@ export class PicksService {
     return { enabled, typeId, typeName: name, price: money(pricePaise), criteria, available: found.length, max: MAX_PICKS };
   }
 
-  /** Opens the ₹99 order (Razorpay). Refused when there is nothing to suggest, so nobody pays for an empty list. */
-  async purchase(userId: string, body: { type: string; near: Near; place?: string }) {
+  /** Opens the ₹99 order (Cashfree). Refused when there is nothing to suggest, so nobody pays for an empty list. */
+  async purchase(userId: string, body: { type: string; near: Near; place?: string; returnTo?: string }) {
     await this.requireOn();
     const pricePaise = await this.rules.picksPricePaise();
     const found = await this.dbs.system(async (tx) => {
@@ -129,18 +134,24 @@ export class PicksService {
     if (found.length === 0) {
       throw new AppError('NO_PICKS', 'OPflow has no suggestions for this type of doctor near you yet. Nothing was charged.', HttpStatus.CONFLICT);
     }
-    const order = await this.gateway.createOrder({ amountPaise: pricePaise, receipt: `PICK-${Date.now().toString(36)}`, notes: { kind: 'picks', typeId: body.type } });
+    // The row first (its id goes into the web version's return link), then the order.
+    const id = randomUUID();
+    const order = await openGatewayOrder(
+      { gateway: this.gateway, dbs: this.dbs, env: this.env },
+      { userId, amountPaise: pricePaise, note: 'OPflow doctor suggestion', returnTo: body.returnTo, back: { key: 'p', id } },
+    );
     const row = await this.dbs.as(asPatient(userId), (tx) =>
       tx
         .insertInto('pickPurchases')
         .values({
+          id,
           patientUserId: userId,
           typeId: body.type,
           nearLat: body.near.lat,
           nearLng: body.near.lng,
           place: body.place?.slice(0, 80) ?? null,
           amountPaise: pricePaise,
-          razorpayOrderId: order.id,
+          gatewayOrderId: order.id,
           consentAt: new Date(),
         })
         .returning('id')
@@ -148,45 +159,46 @@ export class PicksService {
     );
     return {
       purchase: { id: row.id, status: 'pending_payment' },
-      payment: { orderId: order.id, keyId: this.gateway.keyId, amount: money(pricePaise), currency: 'INR', fake: this.gateway.isFake },
+      payment: checkoutFor(this.gateway, order, pricePaise),
     };
   }
 
-  /** After Checkout: check the signature and the payment itself with Razorpay, then build the suggestion. */
-  async verify(userId: string, input: { orderId: string; paymentId: string; signature: string }) {
+  /** After the checkout closes: asks Cashfree about the order (nothing from the phone is trusted), then builds the suggestion. */
+  async verify(userId: string, input: { orderId: string }) {
     const row = await this.dbs.as(asPatient(userId), (tx) =>
-      tx.selectFrom('pickPurchases').select(['id', 'amountPaise']).where('razorpayOrderId', '=', input.orderId).executeTakeFirst(),
+      tx.selectFrom('pickPurchases').select(['id', 'amountPaise']).where('gatewayOrderId', '=', input.orderId).executeTakeFirst(),
     );
     if (!row) throw new AppError('PAYMENT_NOT_FOUND', 'We could not find this payment. If money was taken, it will come back automatically.', HttpStatus.NOT_FOUND);
-    if (!this.gateway.verifyPaymentSignature(input.orderId, input.paymentId, input.signature)) {
-      throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
+    const attempts = await this.gateway.fetchOrderPayments(input.orderId);
+    const paid = attempts.find((p) => p.status === 'captured');
+    if (paid) {
+      if (paid.amount !== row.amountPaise) {
+        this.log.error(`Pick order ${input.orderId}: paid ${paid.amount}, expected ${row.amountPaise}`);
+        throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
+      }
+      await this.settle(row.id, paid);
+    } else if (attempts.length > 0 && attempts.every((p) => p.status === 'failed')) {
+      throw new AppError('PAYMENT_FAILED', 'The payment did not go through. No money was taken. Please try again.', HttpStatus.PAYMENT_REQUIRED);
     }
-    const gp = await this.gateway.fetchPayment(input.paymentId);
-    if (gp.orderId !== input.orderId || gp.amount !== row.amountPaise) {
-      this.log.error(`Pick payment ${input.paymentId} does not match order ${input.orderId}`);
-      throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
-    }
-    if (gp.status === 'failed') throw new AppError('PAYMENT_FAILED', 'The payment did not go through. No money was taken. Please try again.', HttpStatus.PAYMENT_REQUIRED);
-    if (gp.status === 'captured') await this.settle(row.id, gp);
     return this.get(userId, row.id);
   }
 
-  /** "Was I charged?" after a web redirect or an unsure result: asks Razorpay; never charges. */
+  /** "Was I charged?" after a web redirect or an unsure result: asks Cashfree; never charges. */
   async check(userId: string, id: string) {
     const row = await this.dbs.as(asPatient(userId), (tx) =>
-      tx.selectFrom('pickPurchases').select(['id', 'status', 'razorpayOrderId']).where('id', '=', id).executeTakeFirst(),
+      tx.selectFrom('pickPurchases').select(['id', 'status', 'gatewayOrderId']).where('id', '=', id).executeTakeFirst(),
     );
     if (!row) throw new AppError('NOT_FOUND', 'We could not find this suggestion.', HttpStatus.NOT_FOUND);
     if (row.status === 'pending_payment') {
-      const captured = (await this.gateway.fetchOrderPayments(row.razorpayOrderId).catch(() => [])).find((p) => p.status === 'captured');
+      const captured = (await this.gateway.fetchOrderPayments(row.gatewayOrderId).catch(() => [])).find((p) => p.status === 'captured');
       if (captured) await this.settle(row.id, captured);
     }
     return this.get(userId, id);
   }
 
-  /** From the Razorpay webhook: a pick order was paid (the phone may never have come back). True when it was one. */
+  /** From the Cashfree webhook: a pick order was paid (the phone may never have come back). True when it was one. */
   async webhookPaid(orderId: string, gp: GatewayPayment): Promise<boolean> {
-    const row = await this.dbs.system((tx) => tx.selectFrom('pickPurchases').select('id').where('razorpayOrderId', '=', orderId).executeTakeFirst());
+    const row = await this.dbs.system((tx) => tx.selectFrom('pickPurchases').select('id').where('gatewayOrderId', '=', orderId).executeTakeFirst());
     if (!row) return false;
     await this.settle(row.id, gp);
     return true;
@@ -208,7 +220,7 @@ export class PicksService {
       const snapshot: Snapshot[] = found.map((c) => ({ doctorId: c.doctorId, reasons: c.reasons, distanceM: Math.round(c.distanceM) }));
       await tx
         .updateTable('pickPurchases')
-        .set({ status: 'paid', paidAt: new Date(), razorpayPaymentId: gp.id, result: JSON.stringify(snapshot) })
+        .set({ status: 'paid', paidAt: new Date(), gatewayPaymentId: gp.id, result: JSON.stringify(snapshot) })
         .where('id', '=', purchaseId)
         .execute();
       return snapshot.length === 0;
@@ -218,8 +230,9 @@ export class PicksService {
 
   private async refund(purchaseId: string, reason: string): Promise<void> {
     const p = await this.dbs.system((tx) => tx.selectFrom('pickPurchases').selectAll().where('id', '=', purchaseId).executeTakeFirstOrThrow());
-    if (p.status !== 'paid' || !p.razorpayPaymentId) throw new AppError('NOT_REFUNDABLE', 'Only a paid suggestion can be refunded.', HttpStatus.CONFLICT);
-    const r = await this.gateway.refund(p.razorpayPaymentId, p.amountPaise, { purchaseId, reason: reason.slice(0, 200) });
+    if (p.status !== 'paid' || !p.gatewayPaymentId) throw new AppError('NOT_REFUNDABLE', 'Only a paid suggestion can be refunded.', HttpStatus.CONFLICT);
+    // Our own refund id: asking again (a retry) never refunds twice.
+    const r = await this.gateway.refund(p.gatewayOrderId, cashfreeId('rp', purchaseId), p.amountPaise, reason.slice(0, 100));
     await this.dbs.system((tx) =>
       tx
         .updateTable('pickPurchases')

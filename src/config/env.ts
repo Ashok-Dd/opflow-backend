@@ -7,7 +7,7 @@ import { z } from 'zod';
  * Environment variables, checked once at startup. A missing or malformed value stops the process with a
  * clear message instead of failing later in the middle of a request.
  *
- * Locally, every outside service (Firebase, Razorpay, R2, Resend, MSG91, Redis) is optional and replaced by a
+ * Locally, every outside service (Firebase, Cashfree, R2, Resend, MSG91, Redis) is optional and replaced by a
  * safe stand-in, so the whole backend runs with only DATABASE_URL. On staging/production the real ones are
  * required. Full documentation: backend/.env.example.
  */
@@ -92,12 +92,19 @@ export const envSchema = z
     MSG91_OTP_TEMPLATE_ID: z.string().optional(),
     MSG91_SENDER_ID: z.string().default('OPFLOW'),
 
-    // Razorpay. Without keys, locally only: a built-in fake that behaves like Razorpay test mode.
-    RAZORPAY_KEY_ID: z.string().optional(),
-    RAZORPAY_KEY_SECRET: z.string().optional(),
-    RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
-    RAZORPAY_ROUTE_ENABLED: bool.default(true),
-    RAZORPAY_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(5000),
+    // Cashfree: Payment Gateway (patients pay) and Payouts (doctors get their 90%). Without keys, locally
+    // only: built-in fakes that behave like Cashfree sandbox. Webhooks are signed with each product's secret.
+    CASHFREE_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
+    CASHFREE_CLIENT_ID: z.string().optional(),
+    CASHFREE_CLIENT_SECRET: z.string().optional(),
+    CASHFREE_API_VERSION: z.string().default('2023-08-01'),
+    CASHFREE_PAYOUT_CLIENT_ID: z.string().optional(),
+    CASHFREE_PAYOUT_CLIENT_SECRET: z.string().optional(),
+    // The Payouts "2FA public key" (.pem file), base64 in one line: base64 -w0 public-key.pem
+    CASHFREE_PAYOUT_PUBLIC_KEY_B64: z.string().optional(),
+    CASHFREE_PAYOUT_API_VERSION: z.string().default('2024-01-01'),
+    CASHFREE_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(8000),
+    PAYOUTS_ENABLED: bool.default(true),
 
     // File storage (S3-compatible: Cloudflare R2 or Supabase Storage). Without it, locally only: files are
     // kept in backend/.uploads and served by the API.
@@ -175,7 +182,8 @@ export const envSchema = z
       if (!env.DEMO_MODE) {
         required.push(
           'FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY_B64', // push (and Firebase login)
-          'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET',
+          'CASHFREE_CLIENT_ID', 'CASHFREE_CLIENT_SECRET',
+          'CASHFREE_PAYOUT_CLIENT_ID', 'CASHFREE_PAYOUT_CLIENT_SECRET', 'CASHFREE_PAYOUT_PUBLIC_KEY_B64',
           'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'CDN_PUBLIC_BASE_URL', 'RESEND_API_KEY',
         );
       }

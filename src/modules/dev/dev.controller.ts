@@ -1,20 +1,20 @@
-import { Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, Req, Res } from '@nestjs/common';
+import { Controller, Get, Headers, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, Req, Res } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 
 import { Public } from '../../common/auth/auth.decorators';
-import { hmacHex } from '../../common/crypto';
 import { AppError } from '../../common/errors/app-error';
 import { ZBody } from '../../common/http/zod';
 import { allowsStandIns, ENV, Env, isLocal } from '../../config/env';
-import { FAKE_WEBHOOK_SECRET, FakeRazorpayGateway, PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { FAKE_WEBHOOK_SECRET, FakeCashfreeGateway, PAYMENT_GATEWAY, PaymentGateway, webhookSignature } from '../../infra/payments/gateway';
+import { FAKE_PAYOUT_WEBHOOK_SECRET, FakePayouts, PAYOUTS, PayoutsProvider } from '../../infra/payments/payouts';
 import { Bucket, LocalStorage, STORAGE, Storage } from '../../infra/storage/storage';
 import { JobsService } from '../jobs/jobs.service';
 
 /**
  * LOCAL DEVELOPMENT ONLY (registered only when APP_ENV=local, and every handler checks again):
- * stand-ins for Razorpay Checkout and for file storage, and a way to run background jobs on demand.
+ * stand-ins for the Cashfree checkout page and for file storage, and a way to run background jobs on demand.
  */
 @ApiExcludeController()
 @Public()
@@ -23,6 +23,7 @@ export class DevController {
   constructor(
     @Inject(ENV) private readonly env: Env,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(PAYOUTS) private readonly payouts: PayoutsProvider,
     @Inject(STORAGE) private readonly storage: Storage,
     private readonly jobs: JobsService,
   ) {}
@@ -34,29 +35,44 @@ export class DevController {
     throw new AppError('NOT_FOUND', 'Not found.', HttpStatus.NOT_FOUND);
   }
 
-  /** What Razorpay Checkout would return to the app. */
-  @Post('razorpay/pay')
+  /** What paying on the Cashfree checkout page does (success, or a failed attempt). The app then asks the server. */
+  @Post('cashfree/pay')
   @HttpCode(200)
   pay(@ZBody(z.object({ orderId: z.string(), fail: z.boolean().optional() })) b: { orderId: string; fail?: boolean }) {
     this.guard(true);
-    if (!(this.gateway instanceof FakeRazorpayGateway)) throw new AppError('NOT_FAKE', 'Real Razorpay keys are set; use real Checkout.', HttpStatus.CONFLICT);
+    if (!(this.gateway instanceof FakeCashfreeGateway)) throw new AppError('NOT_FAKE', 'Real Cashfree keys are set; use the real checkout.', HttpStatus.CONFLICT);
     return this.gateway.pay(b.orderId, { fail: b.fail });
   }
 
-  /** Signs a webhook body the way Razorpay would (to test /v1/webhooks/razorpay locally). */
-  @Post('razorpay/sign')
+  /** Signs a webhook body the way Cashfree would (to test /v1/webhooks/cashfree and …/cashfree-payouts locally). */
+  @Post('cashfree/sign')
   @HttpCode(200)
-  sign(@Req() req: Request & { rawBody?: Buffer }) {
+  sign(@Req() req: Request & { rawBody?: Buffer }, @Query('for') target: string, @Headers('x-webhook-timestamp') ts?: string) {
     this.guard();
-    return { signature: hmacHex(FAKE_WEBHOOK_SECRET, req.rawBody ?? Buffer.from('')) };
+    const timestamp = ts ?? String(Date.now());
+    const secret = target === 'payouts' ? FAKE_PAYOUT_WEBHOOK_SECRET : FAKE_WEBHOOK_SECRET;
+    return { timestamp, signature: webhookSignature(secret, timestamp, req.rawBody ?? Buffer.from('')) };
   }
 
-  /** Test hook: the next Razorpay order fails ("payments are down"). */
-  @Post('razorpay/fail-next-order')
+  /** Test hook: the next Cashfree order fails ("payments are down"). */
+  @Post('cashfree/fail-next-order')
   @HttpCode(200)
   failNext() {
     this.guard();
-    if (this.gateway instanceof FakeRazorpayGateway) this.gateway.failNextOrder = true;
+    if (this.gateway instanceof FakeCashfreeGateway) this.gateway.failNextOrder = true;
+    return { ok: true };
+  }
+
+  /** Test hooks for doctor payouts: the next bank payout fails, or payouts stay "pending" (settled by webhook). */
+  @Post('payouts/:mode')
+  @HttpCode(200)
+  payoutMode(@Param('mode') mode: string) {
+    this.guard();
+    if (!(this.payouts instanceof FakePayouts)) throw new AppError('NOT_FAKE', 'Real Cashfree Payouts keys are set.', HttpStatus.CONFLICT);
+    if (mode === 'fail-next') this.payouts.failNext = true;
+    else if (mode === 'hold') this.payouts.holdTransfers = true;
+    else if (mode === 'normal') this.payouts.holdTransfers = false;
+    else throw new AppError('NOT_FOUND', 'Unknown mode.', HttpStatus.NOT_FOUND);
     return { ok: true };
   }
 
@@ -70,6 +86,7 @@ export class DevController {
       'sessions.generate': () => this.jobs['schedule'].syncAll(),
       'holds.expire': () => this.jobs['payments'].expireHolds(),
       'payouts.release': () => this.jobs['payments'].releaseDueTransfers(),
+      'payouts.sync': () => this.jobs['payments'].syncPendingPayouts(),
       'sessions.auto': () => this.jobs.autoSessions(),
       invariants: () => this.jobs.invariants(),
       housekeeping: () => this.jobs.housekeeping(),

@@ -11,7 +11,7 @@ import { enqueue, uuidv7 } from '../../common/outbox';
 import { maskContact } from '../../infra/messaging/messaging';
 import { DbService, Tx } from '../../infra/db/db.service';
 import type { DocumentKind } from '../../infra/db/schema';
-import { PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { PAYOUTS, PayoutsProvider } from '../../infra/payments/payouts';
 import { STORAGE, Storage } from '../../infra/storage/storage';
 import { PasswordsService } from '../auth/passwords.service';
 import { TokensService } from '../auth/tokens.service';
@@ -55,7 +55,7 @@ export class AdminDoctorsService {
     private readonly dir: DirectoryService,
     private readonly schedule: ScheduleService,
     @Inject(STORAGE) private readonly storage: Storage,
-    @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(PAYOUTS) private readonly payouts: PayoutsProvider,
   ) {}
 
   async list(f: { q?: string; verification?: string; type?: string; hospital?: string; status?: string; limit: number; offset: number }) {
@@ -101,7 +101,7 @@ export class AdminDoctorsService {
         .select(['h.id', 'h.name', 'h.area', 'dh.isPrimary', 'dh.feePaiseOverride', 'dh.status'])
         .where('dh.doctorId', '=', id)
         .execute(),
-      this.dbs.db.selectFrom('payoutAccounts').select(['status', 'bankLast4', 'ifsc', 'razorpayAccountId']).where('doctorId', '=', id).executeTakeFirst(),
+      this.dbs.db.selectFrom('payoutAccounts').select(['status', 'bankLast4', 'ifsc', 'beneficiaryId']).where('doctorId', '=', id).executeTakeFirst(),
     ]);
     const devices = await this.dbs.system((tx) => this.tokens.liveSessions(tx, d.userId, 'doctor'));
     const approved = (k: DocumentKind) => documents.some((x) => x.kind === k && x.status === 'approved');
@@ -350,39 +350,53 @@ export class AdminDoctorsService {
     });
   }
 
-  /** Razorpay Route linked account (the doctor's bank). Only the last 4 digits are stored. */
+  /**
+   * The doctor's bank account as a Cashfree Payouts beneficiary (where their 90% is paid). Only the last 4
+   * digits are stored here. Changing the details makes a new beneficiary (a new id), so old payouts keep theirs.
+   */
   async payoutAccount(
     who: AdminPrincipal,
     doctorId: string,
-    b: { holderName: string; accountNumber: string; ifsc: string; pan: string; email: string; address: { street: string; city: string; state: string; pin: string } },
+    b: { holderName: string; accountNumber: string; ifsc: string; email?: string },
     meta: RequestMeta,
   ) {
     const d = await this.dbs.db
       .selectFrom('doctors as d')
       .innerJoin('users as u', 'u.id', 'd.userId')
-      .select(['d.id', 'u.phone'])
+      .select(['d.id', 'u.phone', 'u.email'])
       .where('d.id', '=', doctorId)
       .executeTakeFirst();
     if (!d) throw new AppError('DOCTOR_NOT_FOUND', 'We could not find this doctor.', HttpStatus.NOT_FOUND);
-    const acc = await this.gateway.createLinkedAccount({
-      referenceId: doctorId.replace(/-/g, '').slice(0, 20),
+    const beneficiaryId = `doc_${doctorId.replace(/-/g, '').slice(0, 20)}_${Date.now().toString(36)}`;
+    const status = await this.payouts.createBeneficiary({
+      id: beneficiaryId,
       name: b.holderName,
-      email: b.email,
-      phone: d.phone ?? '',
-      pan: b.pan,
       accountNumber: b.accountNumber,
       ifsc: b.ifsc,
-      address: b.address,
+      phone: d.phone,
+      email: b.email ?? d.email ?? null,
     });
+    if (status === 'invalid') {
+      throw new AppError('BANK_NOT_VERIFIED', 'The bank could not verify these account details. Please check the account number, IFSC and name.', HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+    const row = { beneficiaryId, status: status === 'active' ? ('active' as const) : ('pending' as const), bankLast4: b.accountNumber.slice(-4), ifsc: b.ifsc };
     await this.dbs.as(as(who), async (tx) => {
-      await tx
-        .insertInto('payoutAccounts')
-        .values({ doctorId, razorpayAccountId: acc.accountId, status: acc.active ? 'active' : 'pending', bankLast4: b.accountNumber.slice(-4), ifsc: b.ifsc })
-        .onConflict((oc) => oc.column('doctorId').doUpdateSet({ razorpayAccountId: acc.accountId, status: acc.active ? 'active' : 'pending', bankLast4: b.accountNumber.slice(-4), ifsc: b.ifsc }))
-        .execute();
-      await audit(tx, { actorType: 'admin', actorId: who.adminId, action: 'doctor.payout_account', entity: 'doctor', entityId: doctorId, after: { last4: b.accountNumber.slice(-4), ifsc: b.ifsc, active: acc.active }, meta });
+      await tx.insertInto('payoutAccounts').values({ doctorId, ...row }).onConflict((oc) => oc.column('doctorId').doUpdateSet(row)).execute();
+      await audit(tx, { actorType: 'admin', actorId: who.adminId, action: 'doctor.payout_account', entity: 'doctor', entityId: doctorId, after: { last4: row.bankLast4, ifsc: b.ifsc, status: row.status }, meta });
     });
-    return { status: acc.active ? 'active' : 'pending', bankLast4: b.accountNumber.slice(-4) };
+    return { status: row.status, bankLast4: row.bankLast4 };
+  }
+
+  /** "Pending" bank checks finish at Cashfree later: asks again (admin page, or before a payout run). */
+  async refreshPayoutAccount(doctorId: string): Promise<string | null> {
+    const acc = await this.dbs.system((tx) => tx.selectFrom('payoutAccounts').select(['beneficiaryId', 'status']).where('doctorId', '=', doctorId).executeTakeFirst());
+    if (!acc?.beneficiaryId || acc.status !== 'pending') return acc?.status ?? null;
+    const status = await this.payouts.beneficiaryStatus(acc.beneficiaryId).catch(() => null);
+    if (status === 'active') {
+      await this.dbs.system((tx) => tx.updateTable('payoutAccounts').set({ status: 'active' }).where('doctorId', '=', doctorId).execute());
+      return 'active';
+    }
+    return acc.status;
   }
 
   // ── Login help ────────────────────────────────────────────────────────────────────────────────────

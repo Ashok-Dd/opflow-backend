@@ -13,7 +13,7 @@ Database: Supabase Postgres (Mumbai), schema in [`migrations/`](migrations/READM
 | Auth | `POST /v1/auth/patient/exchange` (Firebase phone token) · `POST /v1/auth/doctor/login` · `POST /v1/auth/doctor/set-password` · `POST /v1/auth/refresh` · `POST /v1/auth/logout` |
 | Patient | `GET/PATCH/DELETE /v1/me` · `GET/PATCH /v1/me/notification-prefs` · `POST /v1/me/devices` · `GET /v1/notifications` · `POST /v1/notifications/read` · `POST /v1/support/tickets` |
 | Bookings | `POST /v1/bookings/hold` · `POST /v1/bookings/emergency` · `GET /v1/bookings?tab=` · `GET /v1/bookings/:id` · `…/timeline` · `…/reschedule` · `…/receipt` |
-| Payments | `POST /v1/payments/verify` · `POST /v1/payments/:bookingId/retry` · `POST /v1/webhooks/razorpay` |
+| Payments | `POST /v1/payments/verify` · `POST /v1/payments/:bookingId/retry` · `POST /v1/webhooks/cashfree` · `POST /v1/webhooks/cashfree-payouts` |
 | Live line | `GET /v1/live/sessions/:id` (patient board) · WebSocket namespace `/live` (`join {sessionId}` → `board` / `line` events) |
 | Doctor | `GET/PATCH /v1/doctor/me` · photo upload · `bookings-pause` · `today` · `bookings` · cancel / move one booking · cancel a whole day · `schedule` · `leaves` · `emergency` · `earnings` · `reports` · `password` · console: `POST /v1/doctor/sessions/:id/{start,pause,resume,late,end,call-next,done,did-not-come,skip,call-now,mark-reached,put-back}` |
 | Emergency (public) | `GET /v1/emergency/near?kind=&lat=&lng=` · `GET /v1/emergency/first-aid[/:kind]` |
@@ -41,7 +41,7 @@ on staging/production):
 | Service | Local stand-in |
 |---|---|
 | Firebase phone login | send `idToken: "dev:+919876543210"` to `/v1/auth/patient/exchange` |
-| Razorpay | fake gateway: after `hold`, call `POST /v1/dev/razorpay/pay {orderId}` and send its result to `/v1/payments/verify` |
+| Cashfree | fake gateway: after `hold`, call `POST /v1/dev/cashfree/pay {orderId}` (the checkout page), then `POST /v1/payments/verify {orderId}`. Doctor payouts use a fake Payouts too |
 | R2 file storage | files in `backend/.uploads`, served by `/v1/dev/files/…` |
 | FCM / Resend / MSG91 | printed to the log |
 | Redis | in-process rate limits and live signals (fine for one API machine) |
@@ -69,7 +69,7 @@ npm run typecheck
 
 `test:flow` covers: admin setup + TOTP, adding and verifying a doctor (two admins), doctor first login, timings,
 search, hold → pay → confirm, idempotent retries, 6 people racing for 4 places, reschedule rules, webhooks,
-late payment, Razorpay down, pause bookings, emergency consultation money split, live line over WebSocket and
+late payment, Cashfree down, pause bookings, emergency consultation money split, live line over WebSocket and
 polling, doctor cancel + refund, cancel a whole day, admin refunds/reveal/kill switch, first-aid publishing
 rules, refresh-token reuse, old-app upgrade, suspension, and the nightly consistency checks. CI runs all of it.
 

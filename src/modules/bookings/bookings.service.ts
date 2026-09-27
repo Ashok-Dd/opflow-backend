@@ -10,7 +10,6 @@ import { istDayLabel, istRange, istToday } from '../../common/time';
 import { LiveBus } from '../../infra/bus/live-bus';
 import type { ActorType } from '../../infra/db/schema';
 import { DbService, Tx } from '../../infra/db/db.service';
-import { PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
 import { RulesService } from '../../infra/rules/rules.service';
 import { DirectoryService } from '../directory/directory.service';
 import { bumpSession, lockSession, lockSessions, orderKeyFor } from '../live/session-events';
@@ -39,7 +38,6 @@ export class BookingsService {
     private readonly dir: DirectoryService,
     private readonly payments: PaymentsService,
     private readonly bus: LiveBus,
-    @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
   ) {}
 
   async changeRules(): Promise<ChangeRules> {
@@ -66,8 +64,8 @@ export class BookingsService {
     }
   }
 
-  /** Step 1 of booking: keep one place for 10 minutes and open a Razorpay order for the fee. */
-  async hold(userId: string, input: { windowId: string; note?: string }, idempotencyKey?: string) {
+  /** Step 1 of booking: keep one place for 10 minutes and open a Cashfree order for the fee. */
+  async hold(userId: string, input: { windowId: string; note?: string; returnTo?: string }, idempotencyKey?: string) {
     await this.rules.requireBookingsOn();
     // A retry after a failed or closed payment must not be blocked by the unfinished first try.
     if (!idempotencyKey || !(await this.isReplay(userId, idempotencyKey))) await this.payments.releaseOwnHolds(userId);
@@ -159,7 +157,7 @@ export class BookingsService {
       if (isUniqueViolation(err, 'bookings_one_per_doctor_day')) throw alreadyBooked();
       throw err;
     }
-    return this.openOrder(userId, held);
+    return this.openOrder(userId, held, input.returnTo);
   }
 
   /** Same Idempotency-Key as an earlier hold: a network retry of the same tap (keep that hold). */
@@ -171,7 +169,7 @@ export class BookingsService {
   }
 
   /** Emergency consultation: fee + emergency charge, E-token, top of the line. */
-  async holdEmergency(userId: string, doctorId: string, idempotencyKey?: string) {
+  async holdEmergency(userId: string, doctorId: string, idempotencyKey?: string, returnTo?: string) {
     await this.rules.requireEmergencyConsultOn();
     // A retry after a failed or closed payment must not be blocked by the unfinished first try.
     if (!idempotencyKey || !(await this.isReplay(userId, idempotencyKey))) await this.payments.releaseOwnHolds(userId);
@@ -243,7 +241,7 @@ export class BookingsService {
       }
       throw err;
     }
-    return this.openOrder(userId, held);
+    return this.openOrder(userId, held, returnTo);
   }
 
   /** Today's open session at the emergency hospital, or a short one made just for emergencies. */
@@ -293,21 +291,20 @@ export class BookingsService {
     return row.id;
   }
 
-  /** Creates the Razorpay order for a held booking. If Razorpay is down, the place is released at once. */
-  private async openOrder(userId: string, held: { bookingId: string; amount: number; code: string; holdExpiresAt: Date }) {
-    let orderId: string;
+  /** Creates the Cashfree order for a held booking. If Cashfree is down, the place is released at once. */
+  private async openOrder(userId: string, held: { bookingId: string; amount: number; code: string; holdExpiresAt: Date }, returnTo?: string) {
+    let order: { id: string; sessionId: string };
     try {
-      const order = await this.gateway.createOrder({ amountPaise: held.amount, receipt: held.code, notes: { bookingId: held.bookingId } });
-      orderId = order.id;
+      order = await this.payments.openOrder(userId, { bookingId: held.bookingId, amountPaise: held.amount, code: held.code, returnTo });
       await this.dbs.as({ role: 'patient', userId }, (tx) =>
-        tx.insertInto('payments').values({ bookingId: held.bookingId, razorpayOrderId: order.id, amountPaise: held.amount }).execute(),
+        tx.insertInto('payments').values({ bookingId: held.bookingId, gatewayOrderId: order.id, amountPaise: held.amount }).execute(),
       );
     } catch (err) {
       await this.releaseHold(held.bookingId).catch(() => undefined);
       throw err;
     }
     const booking = await this.get(userId, held.bookingId);
-    return { booking, payment: this.payments.checkout(orderId, held.amount), holdExpiresAt: held.holdExpiresAt };
+    return { booking, payment: this.payments.checkout(order, held.amount), holdExpiresAt: held.holdExpiresAt };
   }
 
   private async releaseHold(bookingId: string): Promise<void> {
@@ -524,8 +521,10 @@ export class BookingsService {
       }
       const t = await tx.selectFrom('transfers').select(['id', 'status']).where('paymentId', '=', p.id).forUpdate().executeTakeFirst();
       if (t && (t.status === 'on_hold' || t.status === 'released')) {
-        await tx.updateTable('transfers').set({ status: 'reversed', reversedAt: new Date() }).where('id', '=', t.id).execute();
-        if (t.status === 'released') await enqueue(tx, { topic: 'transfer.reverse', payload: { transferId: t.id } }, { dedupeKey: `reverse:${t.id}` });
+        // Already in a payout to the doctor: the amount is taken from their next payout (a bank payout can't be pulled back).
+        await sql`update transfers set status = 'reversed', reversed_at = now(),
+                         recover_paise = case when status = 'released' then amount_paise else 0 end
+                   where id = ${t.id}`.execute(tx);
       }
     }
     await tx

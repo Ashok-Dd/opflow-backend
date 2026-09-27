@@ -37,9 +37,12 @@ describe('loadEnv', () => {
     FIREBASE_PROJECT_ID: 'opflow-prod',
     FIREBASE_CLIENT_EMAIL: 'a@b.iam.gserviceaccount.com',
     FIREBASE_PRIVATE_KEY_B64: 'x',
-    RAZORPAY_KEY_ID: 'rzp_live_x',
-    RAZORPAY_KEY_SECRET: 'x',
-    RAZORPAY_WEBHOOK_SECRET: 'x',
+    CASHFREE_ENV: 'production',
+    CASHFREE_CLIENT_ID: 'x',
+    CASHFREE_CLIENT_SECRET: 'x',
+    CASHFREE_PAYOUT_CLIENT_ID: 'x',
+    CASHFREE_PAYOUT_CLIENT_SECRET: 'x',
+    CASHFREE_PAYOUT_PUBLIC_KEY_B64: 'x',
     R2_ACCESS_KEY_ID: 'x',
     R2_SECRET_ACCESS_KEY: 'x',
     CDN_PUBLIC_BASE_URL: 'https://photos.opflow.in',
@@ -55,8 +58,8 @@ describe('loadEnv', () => {
   });
 
   it('refuses local stand-ins (fake payments, dev login) outside local development', () => {
-    const { RAZORPAY_KEY_SECRET: _k, FIREBASE_PROJECT_ID: _f, ...missing } = production;
-    expect(() => loadEnv(missing)).toThrow(/RAZORPAY_KEY_SECRET[\s\S]*FIREBASE_PROJECT_ID|FIREBASE_PROJECT_ID[\s\S]*RAZORPAY_KEY_SECRET/);
+    const { CASHFREE_CLIENT_SECRET: _k, FIREBASE_PROJECT_ID: _f, ...missing } = production;
+    expect(() => loadEnv(missing)).toThrow(/CASHFREE_CLIENT_SECRET[\s\S]*FIREBASE_PROJECT_ID|FIREBASE_PROJECT_ID[\s\S]*CASHFREE_CLIENT_SECRET/);
     expect(() => loadEnv({ ...production, STORAGE_PROVIDER: 'local' })).toThrow(/development only/);
     expect(() => loadEnv({ ...production, PASSWORD_PEPPER: 'c2hvcnQ=' })).toThrow(/32 random bytes/);
   });

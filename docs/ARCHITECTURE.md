@@ -20,7 +20,7 @@ These come from the product rules and from the app we already built. Every desig
 | G6 | **Screens feel instant.** p95 read under 200 ms from India; cached lists; no spinner longer than the OP loader already shows. | "Cool and smooth". |
 | G7 | **Every money movement and every status change is recorded** (who, when, why). | Disputes, refunds, audits. |
 | G8 | **No money is ever lost or double-counted.** Every rupee captured ends as exactly one of: confirmed booking, refund, or duplicate-refund, and this is checked every night. | Trust with patients and doctors. |
-| G9 | **One failing dependency never takes the whole app down.** Redis, Razorpay, Firebase or push down: the rest keeps working, and the failing feature says so in plain words. | Hospitals run all day; outages happen. |
+| G9 | **One failing dependency never takes the whole app down.** Redis, Cashfree, Firebase or push down: the rest keeps working, and the failing feature says so in plain words. | Hospitals run all day; outages happen. |
 | G10 | **Old app versions keep working** until we force an update, and we can force one. | People do not update apps. |
 
 **Principles used everywhere below**
@@ -29,7 +29,7 @@ These come from the product rules and from the app we already built. Every desig
 2. **Every state change is a guarded transition:** `UPDATE … SET status = 'b' WHERE id = $1 AND status = 'a'`. Zero rows updated means someone else got there first, so we stop and re-read. No read-modify-write races.
 3. **Every write the app can repeat is idempotent** (Idempotency-Key or a natural unique key), so retries after bad network are always safe.
 4. **Side effects go out after commit** (transactional outbox). Nothing is sent for a change that was rolled back.
-5. **Every external call has a timeout, a retry policy and a circuit breaker.** Never wait forever on Razorpay, Firebase or FCM.
+5. **Every external call has a timeout, a retry policy and a circuit breaker.** Never wait forever on Cashfree, Firebase or FCM.
 6. **Time comes from the database clock** (`now()`), never from the phone. Rules like "2 hours before" are checked on the server.
 
 ---
@@ -38,7 +38,7 @@ These come from the product rules and from the app we already built. Every desig
 
 ```
                         ┌──────────────── Flutter app (patient + doctor) ───────────────┐
-                        │  Dio REST client · WebSocket (live line) · FCM push · Razorpay │
+                        │  Dio REST client · WebSocket (live line) · FCM push · Cashfree │
                         └───────────────┬───────────────────────────┬───────────────────┘
                                         │ HTTPS /v1                 │ WSS /live
 ┌─────────────── Admin site (Next.js) ──┤                           │
@@ -59,7 +59,7 @@ These come from the product rules and from the app we already built. Every desig
                         │ + pg_trgm  │  │              │  │ expiry, reminders, pushes,│
                         └────────────┘  └──────────────┘  │ payouts, outbox relay     │
                                                           └──────────┬───────────────┘
-                 External: Firebase (phone OTP + FCM push) · Razorpay (orders, Route,   │
+                 External: Firebase (phone OTP + FCM push) · Cashfree (orders, payouts, │
                  refunds, webhooks) · Resend (email) · Cloudflare R2 (photos) ◄─────────┘
 ```
 
@@ -79,7 +79,7 @@ A module can be split out later if one outgrows the rest (the live line is the l
 | Real time | **Socket.IO** gateway with the Redis adapter | Works across several API instances. Rooms are per OPD session. |
 | Push | **Firebase Cloud Messaging** | Android and iOS, including when the app is closed. |
 | Patient login | **Firebase Phone Auth**, exchanged for OPflow tokens | No DLT paperwork for the pilot. Swap to MSG91 later by changing one service. |
-| Payments | **Razorpay**: Orders, Checkout (`razorpay_flutter`), webhooks, Refunds, **Route** (split to doctor) | Implements the 90/10 split per booking. |
+| Payments | **Cashfree**: Payment Gateway (orders, checkout via `flutter_cashfree_pg_sdk` / Cashfree JS, webhooks, refunds) and **Payouts** (the doctor's 90% as one bank payout per doctor per run) | Implements the 90/10 split per booking. |
 | Email | **Resend** | Receipts, doctor onboarding, admin alerts. |
 | Files | **Cloudflare R2** (S3 API) behind a CDN, with presigned uploads | Doctor photos and verification documents (documents are private). |
 | Hosting | **Fly.io, Mumbai region (`bom`)**: `api` ×2, `worker` ×1 | Or AWS ECS/App Runner in ap-south-1. Both run the same Docker image. |
@@ -208,7 +208,7 @@ doctors
 
 doctor_hospitals    doctor_id, hospital_id, fee_paise_override null, is_primary, status, pk(doctor_id, hospital_id)
 doctor_documents    id, doctor_id, kind enum(degree, registration, id_proof, other), file_key (private), status, reviewed_by
-payout_accounts     doctor_id pk, razorpay_account_id, status enum(pending, active, suspended), bank_last4, ifsc
+payout_accounts     doctor_id pk, beneficiary_id (Cashfree Payouts), status enum(pending, active, suspended), bank_last4, ifsc
 emergency_status    doctor_id pk, hospital_id, status enum(off, available_now, available_till, on_call),
                     mode enum(at_hospital, phone_first), until_at timestamptz null, updated_at
                     -- a job sets status=off when until_at passes; patients never see stale "available"
@@ -360,22 +360,22 @@ queue_events        -- append-only per session; drives the live stream and time 
 payments
   id                uuid pk
   booking_id        fk
-  razorpay_order_id  varchar unique
-  razorpay_payment_id varchar unique null
+  gateway_order_id   varchar unique              -- our Cashfree order id (op_…)
+  gateway_payment_id varchar unique null         -- Cashfree cf_payment_id
   amount_paise      int, currency char(3) default 'INR'
   status            enum(created, authorized, captured, failed)
   method            varchar null                -- upi, card, netbanking
   failure_reason    text null
-  raw               jsonb                       -- the last Razorpay payload, for support
+  raw               jsonb                       -- the last payment-company payload, for support
 
 refunds
-  id, payment_id, razorpay_refund_id unique null, amount_paise,
+  id, payment_id, gateway_refund_id unique null (our refund id sent to Cashfree), amount_paise,
   reason enum(provider_cancelled, late_payment, duplicate, admin_goodwill), status enum(pending, processed, failed),
   attempts int, next_attempt_at, failure_reason,
   initiated_by fk users/admin
 
-transfers           -- the doctor's 90% (Razorpay Route)
-  id, payment_id unique, doctor_id, razorpay_transfer_id unique null, amount_paise,
+transfers           -- the doctor's 90% of one visit; paid out inside a `payouts` row
+  id, payment_id unique, doctor_id, payout_id null, recover_paise, recovered_in null, amount_paise,
   status enum(on_hold, released, reversed, failed), release_at timestamptz
 
 idempotency_keys    -- replay-safe writes (hold, verify, reschedule, cancel, console commands)
@@ -386,8 +386,11 @@ bulk_operations     -- "cancel the whole day", "move everyone": progress + audit
   id, doctor_id, kind enum(cancel_day, move_day, end_opd_cancel, end_opd_move), session_id,
   total int, done int, failed int, status enum(running, finished, needs_attention), created_by, created_at
 
-webhook_events      -- every Razorpay webhook stored once (dedupe by event id), then processed
-  id varchar pk (razorpay event id), type, payload jsonb, received_at, processed_at null, error text null
+payouts             -- ONE bank payout to a doctor (Cashfree Payouts) covering many visits
+  id, doctor_id, amount_paise = visits_paise − deducted_paise, status (pending | success | failed), cf_transfer_id, utr,
+  failure_reason, settled_at
+webhook_events      -- every Cashfree webhook stored once (dedupe by a hash of its bytes), then processed
+  id varchar pk, provider (cashfree-payments | cashfree-payouts), type, payload jsonb, received_at, processed_at null, error text null
 ```
 
 ### 3.8 Notifications, content, support, platform
@@ -454,7 +457,7 @@ both `SELECT … FOR UPDATE` the booking, one waits, then re-checks the state an
 ### 4.1 Booking and paying (G1, G2, G3, G8)
 
 ```
-App                          API                                     Postgres / Razorpay
+App                          API                                     Postgres / Cashfree
  │ POST /bookings/hold   ──► checks: caller has a patient profile; window open; now() < starts_at − cut-off;
  │  {windowId,                        caller has < 2 active holds; caller has no active booking with this
  │   note}                           doctor on this date (stops one phone taking all places)
@@ -465,17 +468,17 @@ App                          API                                     Postgres / 
  │                                             hold_expires_at = now() + 10 min)
  │                             INSERT payments(created, amount = fee)          ← amount always from the server
  │                           COMMIT
- │                           Razorpay: create order (receipt = booking.code, notes.bookingId), 5 s timeout,
- │                             store razorpay_order_id. Failure → release the slot and return
- │                             503 PAYMENTS_UNAVAILABLE ("Payments are not working right now. No money was taken.")
- │ ◄── {bookingId, token, orderId, amount, keyId, holdExpiresAt}
- │ Razorpay Checkout (payment_capture = auto) ─────────────────────────────► Razorpay
- │ ◄── {razorpay_payment_id, razorpay_signature}
- │ POST /payments/verify ──► verify HMAC; fetch the payment from Razorpay (amount, order id and status must match)
- │                           confirmBooking(paymentId)   ← the one shared function (below)
+ │                           Cashfree: create order (our order_id op_…, patient id + phone, return_url for the
+ │                             web version), 8 s timeout, store gateway_order_id. Failure → release the slot and
+ │                             return 503 PAYMENTS_UNAVAILABLE ("Payments are not working right now. No money was taken.")
+ │ ◄── {bookingId, token, orderId, paymentSessionId, environment, amount, holdExpiresAt}
+ │ Cashfree checkout (phone SDK, or the web page in the same tab) ─────────────► Cashfree
+ │ ◄── "done" (no signature: nothing from the phone is trusted)
+ │ POST /payments/verify {orderId} ──► fetch the order's payments from Cashfree (SUCCESS, amount must match)
+ │                           confirmBooking(payment)   ← the one shared function (below)
  │ ◄── booking (token, window, code)
  │
- │               webhook payment.captured ──► store in webhook_events (dedupe by event id) ──► confirmBooking()
+ │               webhook PAYMENT_SUCCESS ──► signature (timestamp + body) ──► webhook_events (dedupe by body hash) ──► confirmBooking()
 ```
 
 **`confirmBooking(payment)`**, shared by verify and webhook, safe to run twice or at the same time:
@@ -500,10 +503,10 @@ automatically. Never "paid but nothing".
 - **Hold expiry** runs from the **database**, not only Redis. A sweeper every 30 s runs
   `UPDATE … WHERE status='pending_payment' AND hold_expires_at < now() RETURNING …`, and a BullMQ delayed job
   gives second-level accuracy. If Redis is lost, holds still expire.
-- **Before expiring a hold**, the sweeper asks Razorpay once whether the order was paid (for holds with an order).
+- **Before expiring a hold**, the sweeper asks Cashfree once whether the order was paid (for holds with an order).
   This catches payments whose webhook is delayed.
 - **Payment failed or cancelled** in Checkout: the booking stays `pending_payment` until expiry. "Try again" creates a
-  new Razorpay order on the same booking (the previous order is marked abandoned). Only one open order per booking.
+  new Cashfree order on the same booking (the previous order is marked abandoned). Only one open order per booking.
 - **Price lock:** the fee is copied into the booking at hold time, so a doctor changing their fee mid-payment has no effect.
 - **Idempotency-Key:** stored with a hash of the request body. The same key with a different body → `422 IDEMPOTENCY_MISMATCH`.
   Kept 24 h in Postgres (`idempotency_keys` table), cached in Redis.
@@ -523,8 +526,8 @@ All or nothing: the patient can never end up with two places, or none.
 ### 4.3 Doctor cancels (one booking, or the whole day) (G3, G8)
 
 - **One booking:** `POST /doctor/bookings/:id/cancel {reason}` → guarded `confirmed → cancelled_by_provider`,
-  slot released, `refunds(pending, 100% of fee)`, transfer reversed if released, outbox(cancelled). The Razorpay refund
-  call happens **after commit** from the outbox (retried with backoff), so a slow Razorpay never blocks the doctor.
+  slot released, `refunds(pending, 100% of fee)`, transfer reversed if released, outbox(cancelled). The Cashfree refund
+  call happens **after commit** from the outbox (retried with backoff), so a slow Cashfree never blocks the doctor.
 - **Whole day / leave / END OPD "cancel and give money back":** one `bulk_operations` row (who, what, how many) plus a
   BullMQ job per booking, running the same single-booking code. Each is idempotent, so a crash halfway is safe to
   rerun. The doctor sees progress ("12 of 18 refunds started").
@@ -612,11 +615,15 @@ train something better after the pilot (per doctor, per weekday, per hour).
 - **Pause bookings:** `doctors.bookings_paused`. While it's true, `POST /bookings/hold` returns `409 BOOKINGS_PAUSED`
   ("The doctor is not taking new bookings right now"). Existing bookings are untouched.
 
-- Every captured payment creates a Route **transfer of 90%** to the doctor's linked account, **on hold** until
-  24 h after the session ends. The worker releases due transfers every hour.
-- Doctor cancels before release → refund 100%, reverse the transfer (nothing was paid out yet: the common case).
-- Doctor cancels after release (rare, late disputes) → refund 100% from the platform balance; the reversal is
-  recovered from the next settlement (`transfers.status = reversed`).
+- Every captured payment records the doctor's **90%** (`transfers`), **on hold** until 24 h after the session ends and
+  only once the visit is over (completed or did not come).
+- Every hour the worker makes **one Cashfree bank payout per doctor** for all their due visits (`payouts`), minus any
+  money to take back; below the minimum payout (`payouts.min_paise`, ₹100) it waits for a later run. Our payout id is
+  the Cashfree transfer id, so a retry never pays twice; results come back by webhook or the `payouts.sync` job.
+  A payout the bank refuses puts its visits back on hold.
+- Doctor cancels before release → refund 100%, the transfer is reversed (nothing was paid out yet: the common case).
+- Doctor cancels after the payout (rare) → refund 100% from the platform balance; the amount is **deducted from the
+  doctor's next payout** (`transfers.recover_paise`), since a bank payout can't be pulled back.
 - The earnings screen reads `transfers` (not `payments`), so "In bank / Coming / Money back given" matches reality.
 
 ---
@@ -641,7 +648,7 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
 | **doctors** (public) | `GET /doctors?type=&problem=&who=&hospital=&q=&near=&day=today\|tomorrow&lang=&sort=fee\|distance&cursor=` → cards with `nextFree` included (one query, no N+1) · `GET /doctors/:id` (with weekly timings table) |
 | **availability** (public) | `GET /doctors/:id/days?hospital=` → 14-day strip (free counts per day) · `GET /doctors/:id/windows?date=&hospital=` → windows with capacity/booked/held/over |
 | **bookings** (patient) | `POST /bookings/hold` · `GET /bookings?tab=upcoming\|past` · `GET /bookings/:id` (with timeline and live board if today) · `POST /bookings/:id/reschedule` · `GET /bookings/:id/receipt` |
-| **payments** | `POST /payments/verify` (patient) · `POST /payments/:bookingId/retry` · `POST /webhooks/razorpay` (signature-verified, public) |
+| **payments** | `POST /payments/verify` (patient) · `POST /payments/:bookingId/retry` · `POST /webhooks/cashfree` and `POST /webhooks/cashfree-payouts` (signature-verified, public) |
 | **live** | `GET /live/sessions/:id?since=` (patient: own board; doctor: full line) · WS namespace `/live`: `join {sessionId}` (token checked), events `board`, `line` (doctor only) |
 | **doctor** (doctor) | `GET/PATCH /doctor/me` · `POST /doctor/me/photo/upload-url` · `GET /doctor/hospitals` · `GET /doctor/today?hospital=` · `POST /doctor/sessions/:id/{start,pause,resume,late,end}` · `POST /doctor/sessions/:id/queue/{call-next,done,did-not-come,skip,call-now,mark-reached,put-back}` · `POST /doctor/sessions/:id/{direct,emergency}` · `GET /doctor/bookings?date=&filter=` · `GET /doctor/bookings/:id` · `POST /doctor/bookings/:id/{cancel,move}` · `POST /doctor/days/:date/cancel` · `GET/PUT /doctor/schedule?hospital=` · `GET/PUT /doctor/leaves` · `GET/PUT /doctor/emergency` · `GET /doctor/earnings?range=` · `GET /doctor/reports?range=` · `POST /doctor/password` |
 | **emergency** (public) | `GET /emergency/near?kind=&lat=&lng=` → emergency hospitals + doctors whose status is not expired, with `updatedAt` |
@@ -657,17 +664,18 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
 | Job | Trigger | What it does |
 |---|---|---|
 | `sessions.generate` | Nightly 00:30 IST, and on every template or leave change | Creates `opd_sessions` + `opd_windows` for the next `open_days_ahead` days, skipping leave days. Idempotent (unique key). |
-| `holds.expire` | DB sweeper every 30 s (works without Redis) + BullMQ delayed job for accuracy | Checks the Razorpay order once, then pending_payment → expired and slot held → free (guarded transitions). |
+| `holds.expire` | DB sweeper every 30 s (works without Redis) + BullMQ delayed job for accuracy | Checks the Cashfree order once, then pending_payment → expired and slot held → free (guarded transitions). |
 | `outbox.relay` | Continuous (1 s poll, or LISTEN/NOTIFY) | Reads `outbox` rows and fans out to pushes, emails, in-app notifications and WS publishes. Retries with backoff. |
 | `reminders` | Scheduled per booking | 1 day before and 1 hour before ("Your time starts at 10 AM"), respecting prefs. |
 | `turn.alerts` | After each queue event | Push when a patient becomes 2 away and when called. |
 | `sessions.auto` | Every 5 min | Marks `not_come` as `did_not_come` 60 min after their window ends (doctor can undo); auto-ends sessions 3 h after `ends_at`. |
 | `emergency.expire` | Every 5 min | `available_till` past its time → `off`. |
-| `payouts.release` | Hourly | Releases due Route transfers. |
+| `payouts.release` | Hourly | One Cashfree bank payout per doctor for all due visits (minus deductions). |
+| `payouts.sync` | Every 15 min | Asks Cashfree about payouts still pending (or sends them again with the same id). |
 | `refunds.sync` | Webhook + hourly reconcile | Updates refund status and notifies "Money back reached". |
 | `photos.process` | On upload | Resize to WebP sizes, strip EXIF (removes location). |
 | `privacy.purge` | Daily | Scrubs deleted accounts after the retention window; deletes expired OTP/idempotency keys. |
-| `payments.reconcile` | Nightly | Compares Razorpay settlements with `payments`/`transfers`; alerts admins on any mismatch. |
+| `payments.reconcile` | Nightly | Compares Cashfree settlements with `payments`/`transfers`; alerts admins on any mismatch. |
 | `invariants.check` | Nightly + on demand | Runs every check in §10; pages on failure. |
 | `refunds.retry` | Every 15 min | Retries failed refunds (3 tries over 24 h), then hands them to the admin queue. |
 | `bulk.run` | On doctor action | Cancel/move a whole day, one idempotent job per booking; progress in `bulk_operations`. |
@@ -691,7 +699,7 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
 | Images | CDN WebP sizes; the app requests `s` in lists and `l` on the doctor page; `cached_network_image` on the phone. |
 | Live board | Read from Redis `board:{sessionId}` (O(1)), not Postgres. |
 | DB | PgBouncer (transaction mode) in front of Postgres; indexes listed in §3; `EXPLAIN` checks in CI for the 10 hottest queries. |
-| Latency budget | Mumbai region for DB, Redis and API → about 20–40 ms network from Andhra Pradesh. p95 targets: reads < 200 ms, hold < 400 ms (includes Razorpay order), WS fan-out < 1 s. |
+| Latency budget | Mumbai region for DB, Redis and API → about 20–40 ms network from Andhra Pradesh. p95 targets: reads < 200 ms, hold < 400 ms (includes Cashfree order), WS fan-out < 1 s. |
 | App side | Stale-while-revalidate for lists; optimistic UI for console commands and read-marks; the OP loader only for real waits (payment, hold). |
 
 ---
@@ -704,7 +712,7 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
   a server-side "call" feature later (number masking via an exotel-style bridge); it is never sent to the doctor app.
 - **Encryption:** TLS everywhere; DB and R2 encrypted at rest; `note` and document keys encrypted at column level
   (pgcrypto, key in the secrets manager). Verification documents are private R2 objects with 5-minute signed read URLs.
-- **Secrets:** Fly/AWS secrets; nothing in the repo; Razorpay webhook secret rotated yearly.
+- **Secrets:** Fly/AWS secrets; nothing in the repo; Cashfree webhook secret rotated yearly.
 - **Payments:** amount always from the server (never from the app); signature verification; webhook dedupe by event id.
 - **Abuse:** rate limits (§4.7); hold limits (max 2 active holds per account); OTP abuse alerts.
 - **DPDP Act 2023:** consent at signup (link to the privacy policy on the website), account deletion (`DELETE /me`),
@@ -739,8 +747,8 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
 | What breaks | What users see | What the system does |
 |---|---|---|
 | **Redis down** | Everything still works. Live board updates arrive every 15 s instead of instantly. | Postgres is the truth. Caches are skipped (read from DB). Rate limits fall back to an in-memory limiter per instance. Hold expiry continues via the DB sweeper. Jobs queue up in the outbox table and drain when Redis returns. |
-| **Razorpay down or slow** | "Payments are not working right now. No money was taken. Please try in a few minutes." Booking screens still work. | Circuit breaker opens after 5 failures in 30 s; holds are not created while it's open (so no one's place is locked for nothing). Verify/webhook resume when it recovers; reconcile catches anything missed. |
-| **Webhooks delayed or lost** | Nothing (verify from the app usually confirms first). | The hold sweeper checks the order status with Razorpay before expiring; the nightly reconcile compares all captured payments. |
+| **Cashfree down or slow** | "Payments are not working right now. No money was taken. Please try in a few minutes." Booking screens still work. | Circuit breaker opens after 5 failures in 30 s; holds are not created while it's open (so no one's place is locked for nothing). Verify/webhook resume when it recovers; reconcile catches anything missed. |
+| **Webhooks delayed or lost** | Nothing (verify from the app usually confirms first). | The hold sweeper checks the order status with Cashfree before expiring; the nightly reconcile compares all captured payments. |
 | **Firebase OTP down** | "We could not send the code. Please try again in a minute." | Second OTP provider (MSG91) switched on by a config flag. Doctors (password login) are unaffected. |
 | **FCM push down** | Pushes are late. | In-app notifications are still written; the live board still updates over WebSocket; the relay retries pushes for up to 30 min, then drops stale ones (a "your turn" push 30 min late is worse than none). |
 | **Email (Resend) down** | Receipt email is late. | Retries with backoff for 24 h; the receipt is always in the app. |
@@ -751,7 +759,7 @@ REST + JSON, base `/v1`. OpenAPI 3.1 is generated by `@nestjs/swagger` and is th
 | **Doctor's phone offline in OPD** | Console keeps working; a banner says "Offline. Changes will be sent when you're back." | Commands are queued and replayed (§4.4). Patients see the last board plus "Updated 3 min ago". |
 | **Patient offline** | Last known booking and board from cache with "Updated at 10:42"; **Emergency help always works**. | The emergency screen, 108 and the list of emergency hospitals are bundled in the app and refreshed when online, so emergency help never depends on the server. |
 
-**Timeouts (all external calls):** Razorpay 5 s, Firebase verify 3 s, FCM 3 s, R2 presign 2 s, DB statement 5 s
+**Timeouts (all external calls):** Cashfree 5 s, Firebase verify 3 s, FCM 3 s, R2 presign 2 s, DB statement 5 s
 (hot paths 1 s). Retries use exponential backoff with jitter, and only for idempotent calls.
 
 ---
@@ -766,7 +774,7 @@ in the admin "Needs attention" list with a one-click fix where safe.
 | Every `booked` slot has exactly one `confirmed/completed/no_show` booking, and vice versa | join `window_slots` ↔ `bookings` |
 | No slot is `held` past `held_until + 2 min` | sweeper health |
 | Every captured payment maps to exactly one outcome: confirmed booking, or a refund (cancelled / duplicate / late) | `payments` ↔ `bookings` ↔ `refunds` |
-| Sum of captured − refunded = Razorpay settlement report for the day | `payments.reconcile` |
+| Sum of captured − refunded = Cashfree settlement report for the day | `payments.reconcile` |
 | Every confirmed booking has a transfer of exactly 90% (rounded down to the paisa), and OPflow's 10% is the remainder | `transfers` ↔ `bookings` |
 | No transfer is `released` for a booking that is `cancelled_by_provider` without a reversal | `transfers` ↔ `refunds` |
 | `queue_events` versions per session are gap-free (1…N) | window function |
@@ -810,7 +818,7 @@ outbox lag, queue backlog, DB slow queries, circuit-breaker state.
 **Alerts page someone** when an SLO burns too fast, an invariant fails, or the outbox lags over 5 minutes.
 
 **Runbooks** (in `backend/docs/runbooks/`), one page each with checks and safe commands:
-"Patient paid but has no booking", "Doctor says the board is stuck", "Refund failed", "Razorpay outage",
+"Patient paid but has no booking", "Doctor says the board is stuck", "Refund failed", "Cashfree outage",
 "OTP not arriving", "Deploy went bad (rollback)", "Restore the database to a point in time".
 
 ---
@@ -877,7 +885,7 @@ backend/
 │  │  ├─ realtime/                   ← socket.io gateway, redis adapter, room auth
 │  │  ├─ outbox/                     ← outbox.writer (inside transactions), outbox.relay (worker)
 │  │  ├─ firebase/                   ← admin SDK: verify ID tokens, send FCM
-│  │  ├─ razorpay/                   ← client, signature verify, orders, refunds, route transfers
+│  │  ├─ payments/                   ← Cashfree gateway (orders, refunds, webhooks) and Payouts (doctor bank payouts)
 │  │  ├─ storage/                    ← R2 client, presign, image resize
 │  │  └─ mail/                       ← Resend client + templates
 │  └─ modules/
@@ -916,7 +924,7 @@ backend/
 │     └─ health-checks/              ← invariants.processor.ts (§10), reconcile, /health and /ready endpoints
 ├─ test/
 │  ├─ factories/                     ← build users, doctors, sessions quickly
-│  ├─ setup.ts                       ← Testcontainers Postgres + Redis, fake Razorpay, fake Firebase, fixed clock
+│  ├─ setup.ts                       ← Testcontainers Postgres + Redis, fake Cashfree, fake Firebase, fixed clock
 │  └─ e2e/                           ← full flows: book→pay→live→done; reschedule rules; provider cancel refunds
 ├─ Dockerfile                        ← one image; CMD picks api or worker
 ├─ fly.toml                          ← api (2 machines) + worker (1) in bom
@@ -948,7 +956,7 @@ app/lib/
 │  ├─ push/
 │  │  └─ push_service.dart       ← FCM token registration, taps open /booking/:id
 │  ├─ payments/
-│  │  └─ razorpay_checkout.dart  ← wraps razorpay_flutter for the Pay step
+│  │  └─ checkout.dart           ← Cashfree checkout (flutter_cashfree_pg_sdk; Cashfree JS on the web)
 │  └─ repositories/
 │     ├─ booking_repository.dart     (abstract)  ← MockBookingRepository (today's code) | ApiBookingRepository
 │     ├─ doctor_repository.dart, catalog_repository.dart, queue_repository.dart, ...
@@ -1005,7 +1013,7 @@ Screens never see raw exceptions, status codes or stack traces.
 | Too many tries | 429 | "Too many tries. Please wait a minute and try again." Buttons disabled for the `Retry-After` time. |
 | Feature switched off | 503 `FEATURE_OFF` (kill switch) | The server's maintenance sentence; the rest of the app works. |
 | Server error | 500, 502, 503, 504 | Idempotent: retry as for timeouts. Otherwise: "Something went wrong. Please try again." The error is sent to Sentry with its `requestId`. |
-| Payment sheet closed or failed | Razorpay callbacks | "Payment did not go through. No money was taken." + Try again. The hold timer keeps counting. |
+| Payment sheet closed or failed | Cashfree callbacks | "Payment did not go through. No money was taken." + Try again. The hold timer keeps counting. |
 | Payment done but verify failed (network) | — | Never show "failed". Show "Checking your payment…" and poll `GET /bookings/:id` for 60 s. The webhook confirms on the server side (§4.1). If still pending: "We are checking your payment. You will get a message in a few minutes." |
 | Push or socket lost | — | Silent reconnect and polling (§4.4). No error shown unless offline for over 30 s. |
 
@@ -1033,12 +1041,12 @@ renders them the same way everywhere, so no screen can forget one.
 | Integration | Repositories and SQL against real Postgres + Redis | Testcontainers |
 | **Concurrency** | 200 parallel holds on a window with 8 places → exactly 8 confirmed, 0 oversold; 50 parallel CALL NEXT → consistent order | e2e with `Promise.all` |
 | e2e | Every row in the API table; cross-account access attempts (must be 403/404) | supertest |
-| Payments | Signature valid/invalid, duplicate webhook, late webhook after expiry, refund flow | Razorpay test mode + recorded payloads |
+| Payments | Webhook signature valid/invalid, duplicate webhook, late webhook after expiry, refund flow, payouts (one per doctor, minimum, deduction, refused) | Cashfree sandbox + recorded payloads |
 | Contract | OpenAPI diff in CI; the Flutter generated client must compile | openapi-diff |
 | Load | 500 patients watching one session board; 50 bookings/s on hold | k6, before the pilot |
 | State machines | Every transition not in the §4.0 table is refused (code and DB trigger) | table-driven tests |
 | Property-based | Random sequences of hold / pay / expire / reschedule / cancel / console commands never break the §10 invariants | fast-check |
-| Chaos | Kill the worker mid "cancel whole day"; drop Redis during bookings; delay webhooks 10 min; duplicate every webhook; Razorpay 500s | Toxiproxy + scripted scenarios in staging |
+| Chaos | Kill the worker mid "cancel whole day"; drop Redis during bookings; delay webhooks 10 min; duplicate every webhook; Cashfree 500s | Toxiproxy + scripted scenarios in staging |
 | Clock | "2 hours before", hold expiry and auto no-show tested with an injected clock, including across midnight IST | fixed-clock provider |
 | App | Existing widget tests with mock repositories; one integration test against staging | flutter test |
 
@@ -1048,9 +1056,9 @@ renders them the same way everywhere, so no screen can forget one.
 
 - **local:** `docker compose up` (Postgres, Redis, MinIO) + `dbmate up` + `npm run dev` (api) + `npm run worker`; seeded demo data
   (`OPD-10234 / demo1234`).
-- **staging:** Fly.io `bom` + Supabase staging DB + Upstash + Razorpay **test mode**; `deploy.bat` builds the app
+- **staging:** Fly.io `bom` + Supabase staging DB + Upstash + Cashfree **test mode**; `deploy.bat` builds the app
   against staging for demos.
-- **prod:** same shape, Razorpay live keys, daily backups + point-in-time recovery (7 days), restore drill monthly.
+- **prod:** same shape, Cashfree live keys, daily backups + point-in-time recovery (7 days), restore drill monthly.
 - **Migrations:** `dbmate up` in CI before deploy (then `npm run db:types` to refresh the TypeScript types); expand → migrate data → contract, for zero-downtime changes. Rules in `backend/migrations/README.md`.
 - **Alerts:** Sentry errors; uptime on `/health`; queue backlog > 1 min; webhook failures; payment reconcile mismatch;
   p95 latency > 500 ms.
@@ -1065,20 +1073,20 @@ renders them the same way everywhere, so no screen can forget one.
 | B2 ✅ | Auth: patient exchange, doctor login + forced change, refresh rotation, admin skeleton | The app logs in against staging |
 | B3 ✅ | Doctors, hospitals, search, availability (read side) | Home, Find, doctor page and day/time pickers run on real data |
 | B4 ✅ | Schedule templates, leaves, session generator | Doctor's "My timings" saves and patients see the new hours |
-| B5 ✅ | **Bookings + Razorpay (test mode)**: slots, hold, shared confirm path, webhook, expiry sweeper, late/duplicate payments, reschedule, provider cancel + refunds | Concurrency + property tests green; full book → pay → receipt on the phone; invariants job reports zero issues |
+| B5 ✅ | **Bookings + Cashfree (test mode)**: slots, hold, shared confirm path, webhook, expiry sweeper, late/duplicate payments, reschedule, provider cancel + refunds | Concurrency + property tests green; full book → pay → receipt on the phone; invariants job reports zero issues |
 | B6 ✅ | **Live line**: console commands, board cache, WS, gap replay, predictions, offline console queue | Two phones: doctor taps CALL NEXT, the patient board flips within 1 s |
 | B7 ✅ | Notifications: outbox relay, FCM, reminders, turn alerts, email receipts | Pushes arrive with the app closed |
-| B8 ✅ | Doctor profile + photo upload (R2), emergency status, earnings (Route transfers), reports | The doctor's photo appears on patient cards from the CDN |
+| B8 ✅ | Doctor profile + photo upload (R2), emergency status, earnings (payouts), reports | The doctor's photo appears on patient cards from the CDN |
 | B9 ✅ | First-aid content API + admin publishing with doctor review | Emergency Do's and Don'ts served from the server (the bundled copy stays as offline backup) |
 | B10 ✅ | Admin API (all of `admin/docs/ADMIN_PORTAL.md` §5): doctor onboarding (issue login ID), verification, refunds, audit | OPflow staff can onboard a real doctor |
-| B11 | Hardening: failure-mode drills (§9), kill switches, min-version screen, SLO dashboards + alerts, runbooks, load test, pen test, DPDP checklist, restore drill, Razorpay live | Every §9 row tested in staging; pilot go-live with one doctor |
+| B11 | Hardening: failure-mode drills (§9), kill switches, min-version screen, SLO dashboards + alerts, runbooks, load test, pen test, DPDP checklist, restore drill, Cashfree live | Every §9 row tested in staging; pilot go-live with one doctor |
 
 
 **Status (25 Sep 2026): B2–B10 are built** (backend only; the admin website's screens come next). Verified by
 26 end-to-end journeys through the real HTTP API, WebSocket and worker (`npm run test:flow`, also in CI against a
 throwaway Postgres with every migration), 23 unit tests, and 7 checks against the live Supabase database.
-What still needs outside accounts before go-live: Firebase (OTP + push), Razorpay keys (test, then live) and
-Route activation, Cloudflare R2, Resend, MSG91 (DLT template), Redis (only for 2+ API machines), Sentry.
+What still needs outside accounts before go-live: Firebase (OTP + push), Cashfree keys (sandbox, then production) for the
+Payment Gateway and Payouts, Cloudflare R2, Resend, MSG91 (DLT template), Redis (only for 2+ API machines), Sentry.
 Until then each has a local stand-in that is refused outside `APP_ENV=local`.
 Deliberate differences from the plan above: background jobs use the Postgres outbox + `job_leases` (no BullMQ);
 Redis is optional (rate limits and live signals fall back to in-process); Firebase tokens are verified with

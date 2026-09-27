@@ -9,10 +9,12 @@ import { ENV, Env } from '../../config/env';
 import { LiveBus } from '../../infra/bus/live-bus';
 import type { ActorType, RefundReason } from '../../infra/db/schema';
 import { DbService, Tx } from '../../infra/db/db.service';
-import { GatewayPayment, PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { cashfreeId, GatewayPayment, mapPaymentStatus, mapRefundStatus, PAYMENT_GATEWAY, PaymentGateway, toPaise } from '../../infra/payments/gateway';
+import { mapTransferStatus, PAYOUTS, PayoutsProvider, PayoutTransfer } from '../../infra/payments/payouts';
 import { RulesService } from '../../infra/rules/rules.service';
 import { bumpSession, lockSession, orderKeyFor, tokenLabel } from '../live/session-events';
 import { PicksService } from '../picks/picks.service';
+import { checkoutFor, openGatewayOrder } from './orders';
 
 export type ConfirmOutcome = 'confirmed' | 'already' | 'refunded_duplicate' | 'refunded_late';
 
@@ -32,9 +34,10 @@ interface BookingForConfirm {
 }
 
 /**
- * Money in and out: confirming paid bookings, refunds, doctor payouts (Razorpay Route) and webhooks.
+ * Money in and out (Cashfree): confirming paid bookings, refunds, doctor payouts and webhooks.
  * Amounts always come from the database, never from the phone; the database also refuses a payment that
  * isn't exactly fee + emergency charge, or a doctor transfer that isn't exactly 90% of the fee.
+ * The doctor's 90% waits on hold, then goes out as ONE bank payout per doctor per run (Cashfree Payouts).
  */
 
 @Injectable()
@@ -46,43 +49,47 @@ export class PaymentsService {
     private readonly rules: RulesService,
     private readonly bus: LiveBus,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(PAYOUTS) private readonly payouts: PayoutsProvider,
     @Inject(ENV) private readonly env: Env,
     private readonly picks: PicksService,
   ) {}
 
-  /** After Checkout: check the signature and the payment itself with Razorpay, then confirm. */
-  async verify(patientUserId: string, input: { orderId: string; paymentId: string; signature: string }) {
+  /**
+   * After the checkout closes: the app only says which order; the server asks Cashfree for that order's
+   * payments (nothing from the phone is trusted) and confirms a successful one.
+   */
+  async verify(patientUserId: string, input: { orderId: string }) {
     const row = await this.dbs.as({ role: 'patient', userId: patientUserId }, (tx) =>
       tx
         .selectFrom('payments as p')
         .innerJoin('bookings as b', 'b.id', 'p.bookingId')
         .select(['p.id', 'p.amountPaise', 'p.bookingId', 'p.status'])
-        .where('p.razorpayOrderId', '=', input.orderId)
+        .where('p.gatewayOrderId', '=', input.orderId)
         .executeTakeFirst(),
     );
     if (!row) throw new AppError('PAYMENT_NOT_FOUND', 'We could not find this payment. If money was taken, it will come back automatically.', HttpStatus.NOT_FOUND);
-    if (!this.gateway.verifyPaymentSignature(input.orderId, input.paymentId, input.signature)) {
-      throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
+    const attempts = await this.gateway.fetchOrderPayments(input.orderId);
+    const paid = attempts.find((p) => p.status === 'captured');
+    if (paid) {
+      if (paid.amount !== row.amountPaise) {
+        this.log.error(`Order ${input.orderId}: paid ${paid.amount}, expected ${row.amountPaise}`);
+        throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
+      }
+      const outcome = await this.confirm(row.id, paid, 'patient');
+      return { bookingId: row.bookingId, outcome };
     }
-    const gp = await this.gateway.fetchPayment(input.paymentId);
-    if (gp.orderId !== input.orderId || gp.amount !== row.amountPaise) {
-      this.log.error(`Payment ${input.paymentId} does not match order ${input.orderId} (amount ${gp.amount} vs ${row.amountPaise})`);
-      throw new AppError('PAYMENT_NOT_VERIFIED', 'We could not confirm this payment. If money was taken, it will come back automatically.', HttpStatus.BAD_REQUEST);
-    }
-    if (gp.status === 'authorized' || gp.status === 'created') {
+    // UPI still on its way, or the page was closed before paying: not a failure yet.
+    if (attempts.length === 0 || attempts.some((p) => p.status === 'authorized' || p.status === 'created')) {
       return { bookingId: row.bookingId, outcome: 'processing' as const };
     }
-    if (gp.status === 'failed') {
-      await this.dbs.system((tx) => tx.updateTable('payments').set({ failureReason: gp.error ?? 'failed' }).where('id', '=', row.id).where('status', '=', 'created').execute());
-      throw new AppError('PAYMENT_FAILED', 'The payment did not go through. No money was taken. Please try again.', HttpStatus.PAYMENT_REQUIRED);
-    }
-    const outcome = await this.confirm(row.id, gp, 'patient');
-    return { bookingId: row.bookingId, outcome };
+    const last = attempts[attempts.length - 1]!;
+    await this.dbs.system((tx) => tx.updateTable('payments').set({ failureReason: last.error ?? 'failed' }).where('id', '=', row.id).where('status', '=', 'created').execute());
+    throw new AppError('PAYMENT_FAILED', 'The payment did not go through. No money was taken. Please try again.', HttpStatus.PAYMENT_REQUIRED);
   }
 
   /**
    * "Was I charged?" for the patient's own booking: when the phone is unsure (Checkout said failed or cancelled,
-   * the confirm call timed out, UPI still processing), this asks Razorpay directly and confirms a captured
+   * the confirm call timed out, UPI still processing), this asks Cashfree directly and confirms a captured
    * payment through the same single path as the webhook. Never charges and never cancels anything.
    */
   async checkStatus(patientUserId: string, bookingId: string): Promise<{ status: string; paid: boolean }> {
@@ -92,10 +99,10 @@ export class PaymentsService {
     if (!booking) throw new AppError('BOOKING_NOT_FOUND', 'We could not find this booking.', HttpStatus.NOT_FOUND);
     if (booking.status === 'pending_payment' || booking.status === 'expired') {
       const orders = await this.dbs.system((tx) =>
-        tx.selectFrom('payments').select(['id', 'razorpayOrderId']).where('bookingId', '=', bookingId).where('status', 'in', ['created', 'authorized']).execute(),
+        tx.selectFrom('payments').select(['id', 'gatewayOrderId']).where('bookingId', '=', bookingId).where('status', 'in', ['created', 'authorized']).execute(),
       );
       for (const o of orders) {
-        const captured = (await this.gateway.fetchOrderPayments(o.razorpayOrderId).catch(() => [])).find((p) => p.status === 'captured');
+        const captured = (await this.gateway.fetchOrderPayments(o.gatewayOrderId).catch(() => [])).find((p) => p.status === 'captured');
         if (captured) {
           await this.confirm(o.id, captured, 'patient');
           break;
@@ -135,7 +142,7 @@ export class PaymentsService {
       if (gp.amount !== pay.amountPaise) throw new Error(`Amount mismatch on payment ${pay.id}: ${gp.amount} vs ${pay.amountPaise}`);
       await tx
         .updateTable('payments')
-        .set({ status: 'captured', razorpayPaymentId: gp.id, method: gp.method, raw: JSON.stringify({ via, status: gp.status, method: gp.method }) })
+        .set({ status: 'captured', gatewayPaymentId: gp.id, method: gp.method, raw: JSON.stringify({ via, status: gp.status, method: gp.method }) })
         .where('id', '=', pay.id)
         .execute();
 
@@ -318,7 +325,7 @@ export class PaymentsService {
 
   // ── Refunds ────────────────────────────────────────────────────────────────────────────────────────
 
-  /** Records a refund and hands it to the worker (Razorpay is called after commit, with retries). */
+  /** Records a refund and hands it to the worker (Cashfree is called after commit, with retries). */
   async createRefund(
     tx: Tx,
     r: { paymentId: string; amountPaise: number; reason: RefundReason; byType: ActorType; by: string | null; bookingId: string; patientUserId: string | null; approvedBy?: string | null },
@@ -351,21 +358,23 @@ export class PaymentsService {
     return row.id;
   }
 
-  /** Worker: send one refund to Razorpay. Failures are retried 3 times over a day, then shown to admins. */
+  /** Worker: send one refund to Cashfree. Failures are retried 3 times over a day, then shown to admins. */
   async runRefund(refundId: string): Promise<void> {
     const r = await this.dbs.system((tx) => tx
       .selectFrom('refunds as r')
       .innerJoin('payments as p', 'p.id', 'r.paymentId')
-      .select(['r.id', 'r.status', 'r.amountPaise', 'r.attempts', 'r.razorpayRefundId', 'p.razorpayPaymentId', 'p.bookingId'])
+      .select(['r.id', 'r.status', 'r.amountPaise', 'r.attempts', 'r.gatewayRefundId', 'p.gatewayOrderId', 'p.gatewayPaymentId', 'p.bookingId'])
       .where('r.id', '=', refundId)
       .executeTakeFirst());
-    if (!r || r.status !== 'pending' || !r.razorpayPaymentId) return;
+    if (!r || r.status !== 'pending' || !r.gatewayPaymentId) return;
+    // Our own refund id, the same on every try: Cashfree never refunds the same thing twice.
+    const cfRefundId = r.gatewayRefundId ?? cashfreeId('rf', r.id);
     try {
-      const result = r.razorpayRefundId
-        ? await this.gateway.fetchRefund(r.razorpayPaymentId, r.razorpayRefundId)
-        : await this.gateway.refund(r.razorpayPaymentId, r.amountPaise, { refundId: r.id, bookingId: r.bookingId });
+      const result = r.gatewayRefundId
+        ? await this.gateway.fetchRefund(r.gatewayOrderId, cfRefundId)
+        : await this.gateway.refund(r.gatewayOrderId, cfRefundId, r.amountPaise, `OPflow booking ${r.bookingId}`);
       await this.dbs.system(async (tx) => {
-        await tx.updateTable('refunds').set({ razorpayRefundId: result.id, attempts: r.attempts + 1 }).where('id', '=', r.id).execute();
+        await tx.updateTable('refunds').set({ gatewayRefundId: cfRefundId, attempts: r.attempts + 1 }).where('id', '=', r.id).execute();
         if (result.status === 'processed') await this.markRefund(tx, r.id, 'processed');
         if (result.status === 'failed') await this.markRefund(tx, r.id, 'failed', 'Refused by the bank');
       });
@@ -433,7 +442,7 @@ export class PaymentsService {
   // ── Payment retry and holds ────────────────────────────────────────────────────────────────────────
 
   /** "Try again" in Checkout: a new order for the same held booking (the old one is set aside). */
-  async retry(patientUserId: string, bookingId: string) {
+  async retry(patientUserId: string, bookingId: string, returnTo?: string) {
     const b = await this.dbs.as({ role: 'patient', userId: patientUserId }, (tx) =>
       tx.selectFrom('bookings').select(['id', 'status', 'holdExpiresAt', 'code', 'feePaise', 'emergencyChargePaise']).where('id', '=', bookingId).executeTakeFirst(),
     );
@@ -442,26 +451,34 @@ export class PaymentsService {
       throw new AppError('HOLD_EXPIRED', 'Your place was released because payment took too long. Please book again.', HttpStatus.CONFLICT);
     }
     const amount = b.feePaise + b.emergencyChargePaise;
-    const order = await this.gateway.createOrder({ amountPaise: amount, receipt: b.code, notes: { bookingId: b.id } });
+    const order = await this.openOrder(patientUserId, { bookingId: b.id, amountPaise: amount, code: b.code, returnTo });
     await this.dbs.as({ role: 'patient', userId: patientUserId }, async (tx) => {
       await tx.updateTable('payments').set({ abandoned: true }).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).where('abandoned', '=', false).execute();
-      await tx.insertInto('payments').values({ bookingId: b.id, razorpayOrderId: order.id, amountPaise: amount }).execute();
+      await tx.insertInto('payments').values({ bookingId: b.id, gatewayOrderId: order.id, amountPaise: amount }).execute();
     });
-    return { bookingId: b.id, payment: this.checkout(order.id, amount), holdExpiresAt: b.holdExpiresAt };
+    return { bookingId: b.id, payment: checkoutFor(this.gateway, order, amount), holdExpiresAt: b.holdExpiresAt };
   }
 
-  checkout(orderId: string, amountPaise: number) {
-    return { orderId, keyId: this.gateway.keyId, amount: money(amountPaise), currency: 'INR', fake: this.gateway.isFake };
+  /** A Cashfree order for a held booking (used by booking, emergency booking and "Try again"). */
+  openOrder(patientUserId: string, o: { bookingId: string; amountPaise: number; code: string; returnTo?: string }) {
+    return openGatewayOrder(
+      { gateway: this.gateway, dbs: this.dbs, env: this.env },
+      { userId: patientUserId, amountPaise: o.amountPaise, note: `OPflow booking ${o.code}`, returnTo: o.returnTo, back: { key: 'b', id: o.bookingId } },
+    );
+  }
+
+  checkout(order: { id: string; sessionId: string }, amountPaise: number) {
+    return checkoutFor(this.gateway, { ...order, amount: amountPaise }, amountPaise);
   }
 
   /**
-   * Job (every 30 s): holds whose time ran out. Razorpay is asked once first, in case the payment went
+   * Job (every 30 s): holds whose time ran out. Cashfree is asked once first, in case the payment went
    * through and its webhook is late. Works without Redis.
    */
   /**
    * Before a patient holds a new place: their own unfinished holds (a payment that failed or was closed, then
    * "Try again") would block the retry for up to 10 minutes ("You already have a booking…", "finish paying for
-   * your other booking first"). Each is asked about at Razorpay: paid → confirmed (the right answer), not paid
+   * your other booking first"). Each is asked about at Cashfree: paid → confirmed (the right answer), not paid
    * → released now. A payment that still arrives later is handled like any late payment (place if free, else
    * money back).
    */
@@ -471,13 +488,13 @@ export class PaymentsService {
     );
     for (const b of mine) {
       const orders = await this.dbs.system((tx) =>
-        tx.selectFrom('payments').select(['id', 'razorpayOrderId']).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).execute(),
+        tx.selectFrom('payments').select(['id', 'gatewayOrderId']).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).execute(),
       );
       let paid = false;
       let unsure = false;
       for (const o of orders) {
         try {
-          const ps = await this.gateway.fetchOrderPayments(o.razorpayOrderId);
+          const ps = await this.gateway.fetchOrderPayments(o.gatewayOrderId);
           const captured = ps.find((x) => x.status === 'captured');
           if (captured) {
             await this.confirm(o.id, captured, 'patient');
@@ -487,7 +504,7 @@ export class PaymentsService {
           // Money on its way (authorized): leave the hold; the sweeper settles it.
           if (ps.some((x) => x.status === 'authorized')) unsure = true;
         } catch {
-          unsure = true; // Razorpay unreachable: keep the hold, never guess
+          unsure = true; // Cashfree unreachable: keep the hold, never guess
         }
       }
       if (paid || unsure) continue;
@@ -516,11 +533,11 @@ export class PaymentsService {
     let expired = 0;
     let confirmed = 0;
     for (const b of due) {
-      const orders = await this.dbs.system((tx) => tx.selectFrom('payments').select(['id', 'razorpayOrderId']).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).execute());
+      const orders = await this.dbs.system((tx) => tx.selectFrom('payments').select(['id', 'gatewayOrderId']).where('bookingId', '=', b.id).where('status', 'in', ['created', 'authorized']).execute());
       let paid = false;
       for (const o of orders) {
         try {
-          const captured = (await this.gateway.fetchOrderPayments(o.razorpayOrderId)).find((p) => p.status === 'captured');
+          const captured = (await this.gateway.fetchOrderPayments(o.gatewayOrderId)).find((p) => p.status === 'captured');
           if (captured) {
             await this.confirm(o.id, captured, 'sweeper');
             paid = true;
@@ -528,7 +545,7 @@ export class PaymentsService {
             break;
           }
         } catch {
-          /* Razorpay unreachable: expire now; a late webhook still confirms or refunds (confirm handles "expired"). */
+          /* Cashfree unreachable: expire now; a late webhook still confirms or refunds (confirm handles "expired"). */
         }
       }
       if (paid) continue;
@@ -546,124 +563,237 @@ export class PaymentsService {
     return { expired, confirmed };
   }
 
-  // ── Doctor payouts (Route) ─────────────────────────────────────────────────────────────────────────
+  // ── Doctor payouts (Cashfree Payouts) ───────────────────────────────────────────────────────────────
 
-  /** Job (hourly): transfers whose hold time is over go to the doctor's bank account. */
-  async releaseDueTransfers(limit = 100): Promise<{ released: number; waiting: number }> {
-    if (!this.env.RAZORPAY_ROUTE_ENABLED) return { released: 0, waiting: 0 };
-    const due = await this.dbs.sys(sql<{ id: string; amountPaise: number; doctorId: string; razorpayPaymentId: string | null; accountId: string | null; accountStatus: string | null; bookingId: string }>`
-      select t.id, t.amount_paise, t.doctor_id, p.razorpay_payment_id, pa.razorpay_account_id as account_id, pa.status as account_status, p.booking_id
+  /**
+   * Job (hourly): for each doctor, the visits whose hold is over become ONE bank payout (minus any money to take
+   * back from earlier payouts). Below the minimum, the money waits for a later run. The bank call happens after
+   * the rows are saved, with our payout id, so a retry never pays twice.
+   */
+  async releaseDueTransfers(limit = 200): Promise<{ released: number; waiting: number; payouts: number }> {
+    if (!this.env.PAYOUTS_ENABLED) return { released: 0, waiting: 0, payouts: 0 };
+    const due = await this.dbs.sys(sql<{ doctorId: string; n: number }>`
+      select t.doctor_id, count(*)::int as n
         from transfers t join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
-        left join payout_accounts pa on pa.doctor_id = t.doctor_id
        where t.status = 'on_hold' and t.release_at <= now()
          -- Only visits that are over (seen, or did not come). A booking still open — e.g. the patient was asked
-         -- to pick a new time — is never paid out, so a later refund never has to pull money back from the doctor.
+         -- to pick a new time — is never paid out, so a later refund rarely has to take money back from the doctor.
          and b.status in ('completed', 'no_show')
-       order by t.release_at limit ${limit}`);
+       group by t.doctor_id limit ${limit}`);
+    const minPaise = await this.rules.payoutsMinPaise();
     let released = 0;
     let waiting = 0;
-    const sent = new Map<string, number>(); // doctor → paise sent in this run
-    for (const t of due.rows) {
-      if (!t.accountId || t.accountStatus !== 'active' || !t.razorpayPaymentId) {
-        waiting++;
+    let made = 0;
+    for (const d of due.rows) {
+      const payout = await this.dbs.system(async (tx) => {
+        const acc = await tx.selectFrom('payoutAccounts').select(['beneficiaryId', 'status']).where('doctorId', '=', d.doctorId).executeTakeFirst();
+        if (!acc?.beneficiaryId || acc.status !== 'active') return null;
+        const visits = await sql<{ id: string; amountPaise: number }>`
+          select t.id, t.amount_paise from transfers t join payments p on p.id = t.payment_id join bookings b on b.id = p.booking_id
+           where t.doctor_id = ${d.doctorId} and t.status = 'on_hold' and t.release_at <= now() and b.status in ('completed', 'no_show')
+           order by t.release_at for update of t`.execute(tx);
+        const visitsPaise = visits.rows.reduce((a, r) => a + r.amountPaise, 0);
+        if (visitsPaise === 0) return null;
+        // Money to take back (visits refunded after an earlier payout) comes off first, whole amounts in order,
+        // as far as this run's visits cover it; what is left must still reach the minimum, or it all waits.
+        const owed = await tx
+          .selectFrom('transfers')
+          .select(['id', 'recoverPaise'])
+          .where('doctorId', '=', d.doctorId)
+          .where('recoverPaise', '>', 0)
+          .where('recoveredIn', 'is', null)
+          .orderBy('createdAt')
+          .forUpdate()
+          .execute();
+        let deducted = 0;
+        const taken: string[] = [];
+        for (const o of owed) {
+          if (deducted + o.recoverPaise > visitsPaise) break;
+          deducted += o.recoverPaise;
+          taken.push(o.id);
+        }
+        const amount = visitsPaise - deducted;
+        if (amount < minPaise || amount <= 0) return null;
+        const row = await tx
+          .insertInto('payouts')
+          .values({ doctorId: d.doctorId, amountPaise: amount, visitsPaise, deductedPaise: deducted })
+          .returning('id')
+          .executeTakeFirstOrThrow();
+        await tx
+          .updateTable('transfers')
+          .set({ status: 'released', releasedAt: new Date(), payoutId: row.id })
+          .where('id', 'in', visits.rows.map((v) => v.id))
+          .execute();
+        if (taken.length) await tx.updateTable('transfers').set({ recoverPaise: 0, recoveredIn: row.id }).where('id', 'in', taken).execute();
+        return { id: row.id, amount, beneficiaryId: acc.beneficiaryId, visits: visits.rows.length };
+      });
+      if (!payout) {
+        waiting += d.n;
         continue;
       }
-      try {
-        const r = await this.gateway.transfer(t.razorpayPaymentId, t.accountId, t.amountPaise, { transferId: t.id, bookingId: t.bookingId });
-        await this.dbs.system((tx) =>
-          tx.updateTable('transfers').set({ status: 'released', releasedAt: new Date(), razorpayTransferId: r.id }).where('id', '=', t.id).where('status', '=', 'on_hold').execute(),
-        );
-        released++;
-        sent.set(t.doctorId, (sent.get(t.doctorId) ?? 0) + t.amountPaise);
-      } catch (err) {
-        this.log.warn(`Transfer ${t.id} not released yet: ${(err as Error).message}`);
-      }
+      made++;
+      released += payout.visits;
+      await this.sendPayout(payout.id, payout.beneficiaryId, payout.amount);
     }
-    // One message per doctor per run, not one per patient.
-    for (const [doctorId, paise] of sent) {
-      await this.dbs.system(async (tx) => {
-        const d = await tx.selectFrom('doctors').select('userId').where('id', '=', doctorId).executeTakeFirst();
-        if (!d?.userId) return;
-        await notify(tx, {
-          userId: d.userId,
-          kind: 'system',
-          title: 'Money sent to your bank',
-          body: `${money(paise).display} is on its way to your bank account. It usually arrives within 1 working day.`,
-          data: { forDoctor: 'true' },
-        });
-      });
-    }
-    return { released, waiting };
+    return { released, waiting, payouts: made };
   }
 
-  /** Worker: take back money already sent to a doctor (rare: a cancel after payout). */
-  async runTransferReversal(transferId: string): Promise<void> {
-    const t = await this.dbs.system((tx) => tx.selectFrom('transfers').select(['id', 'razorpayTransferId', 'amountPaise', 'status']).where('id', '=', transferId).executeTakeFirst());
-    if (!t?.razorpayTransferId || t.status !== 'reversed') return;
-    await this.gateway.reverseTransfer(t.razorpayTransferId, t.amountPaise);
+  /** Asks Cashfree to pay one payout. Unsure (timeout) → stays pending; the sync job asks again later. */
+  private async sendPayout(payoutId: string, beneficiaryId: string, amountPaise: number): Promise<void> {
+    let t: PayoutTransfer;
+    try {
+      t = await this.payouts.transfer(cashfreeId('po', payoutId), beneficiaryId, amountPaise, 'OPflow consultation fees');
+    } catch (err) {
+      this.log.warn(`Payout ${payoutId} not sent yet: ${(err as Error).message}`);
+      return;
+    }
+    await this.applyPayoutStatus(payoutId, t);
+  }
+
+  /** Job (every 15 min): payouts still pending after 10 minutes are asked about (or sent again, same id). */
+  async syncPendingPayouts(limit = 50): Promise<number> {
+    const rows = await this.dbs.system((tx) =>
+      tx
+        .selectFrom('payouts as po')
+        .innerJoin('payoutAccounts as a', 'a.doctorId', 'po.doctorId')
+        .select(['po.id', 'po.amountPaise', 'a.beneficiaryId'])
+        .where('po.status', '=', 'pending')
+        .where('po.createdAt', '<', new Date(Date.now() - 10 * 60_000))
+        .orderBy('po.createdAt')
+        .limit(limit)
+        .execute(),
+    );
+    for (const r of rows) {
+      try {
+        await this.applyPayoutStatus(r.id, await this.payouts.transferStatus(cashfreeId('po', r.id)));
+      } catch (err) {
+        // Never reached Cashfree (e.g. a timeout before it was created): send it now, with the same id.
+        const code = (err as { providerCode?: string }).providerCode;
+        if (code === 'transfer_not_found' || (err as { providerStatus?: number }).providerStatus === 404) {
+          if (r.beneficiaryId) await this.sendPayout(r.id, r.beneficiaryId, r.amountPaise);
+        } else {
+          this.log.warn(`Payout ${r.id} status unknown: ${(err as Error).message}`);
+        }
+      }
+    }
+    return rows.length;
+  }
+
+  /** THE place a payout's result is saved (bank call, sync job and webhook may race; the row lock decides). */
+  private async applyPayoutStatus(payoutId: string, t: PayoutTransfer): Promise<void> {
+    if (t.status === 'pending') {
+      if (t.cfTransferId) await this.dbs.system((tx) => tx.updateTable('payouts').set({ cfTransferId: t.cfTransferId }).where('id', '=', payoutId).execute());
+      return;
+    }
+    await this.dbs.system(async (tx) => {
+      const po = await tx.selectFrom('payouts').selectAll().where('id', '=', payoutId).forUpdate().executeTakeFirst();
+      if (!po || po.status === t.status) return;
+      if (t.status === 'success') {
+        if (po.status !== 'pending') return;
+        await tx.updateTable('payouts').set({ status: 'success', settledAt: new Date(), utr: t.utr, cfTransferId: t.cfTransferId ?? po.cfTransferId }).where('id', '=', po.id).execute();
+        const d = await tx.selectFrom('doctors').select('userId').where('id', '=', po.doctorId).executeTakeFirst();
+        if (d?.userId) {
+          await notify(tx, {
+            userId: d.userId,
+            kind: 'system',
+            title: 'Money sent to your bank',
+            body: `${money(po.amountPaise).display} was paid to your bank account${t.utr ? ` (bank reference ${t.utr})` : ''}. Banks can take a few hours to show it.`,
+            data: { forDoctor: 'true' },
+            dedupeKey: `payout:${po.id}`,
+          });
+        }
+        return;
+      }
+      // Failed, rejected, or reversed by the bank (even after "success"): nothing reached the doctor.
+      await tx.updateTable('payouts').set({ status: 'failed', settledAt: new Date(), failureReason: (t.reason ?? 'Refused by the bank').slice(0, 300) }).where('id', '=', po.id).execute();
+      // Its visits go back on hold for a later run…
+      await tx.updateTable('transfers').set({ status: 'on_hold', releasedAt: null, payoutId: null }).where('payoutId', '=', po.id).where('status', '=', 'released').execute();
+      // …visits refunded meanwhile were never paid, so there is nothing to take back for them…
+      await tx.updateTable('transfers').set({ recoverPaise: 0 }).where('payoutId', '=', po.id).where('status', '=', 'reversed').execute();
+      // …and money it took back is owed again.
+      await sql`update transfers set recover_paise = amount_paise, recovered_in = null where recovered_in = ${po.id}`.execute(tx);
+    });
   }
 
   // ── Webhooks ───────────────────────────────────────────────────────────────────────────────────────
 
-  /** Stores each Razorpay event once (by its id), then applies it. Unknown events are stored and ignored. */
-  async handleWebhook(eventId: string, event: { event?: string; payload?: Record<string, { entity?: Record<string, unknown> }> }): Promise<void> {
-    const type = String(event.event ?? 'unknown');
+  /**
+   * Stores each Cashfree event once (by a hash of its exact bytes, since Cashfree sends no event id), then
+   * applies it. Unknown events are stored and ignored. `source` tells payments from payouts apart.
+   */
+  async handleWebhook(eventId: string, source: 'payments' | 'payouts', event: { type?: string; data?: Record<string, unknown> }): Promise<void> {
+    const type = String(event.type ?? 'unknown').replace(/_WEBHOOK$/, '');
     const fresh = await sql<{ id: string }>`
-      insert into webhook_events (id, type, payload) values (${eventId}, ${type}, ${JSON.stringify(event)})
+      insert into webhook_events (id, provider, type, payload) values (${eventId}, ${`cashfree-${source}`.slice(0, 20)}, ${type.slice(0, 60)}, ${JSON.stringify(event)})
       on conflict (id) do nothing returning id`.execute(this.dbs.db);
     if (fresh.rows.length === 0) {
       const prior = await this.dbs.db.selectFrom('webhookEvents').select('processedAt').where('id', '=', eventId).executeTakeFirst();
       if (prior?.processedAt) return; // already handled
     }
     try {
-      await this.applyWebhook(type, event.payload ?? {});
+      if (source === 'payments') await this.applyPaymentWebhook(type, event.data ?? {});
+      else await this.applyPayoutWebhook(type, event.data ?? {});
       await this.dbs.db.updateTable('webhookEvents').set({ processedAt: new Date(), error: null }).where('id', '=', eventId).execute();
     } catch (err) {
       await this.dbs.db.updateTable('webhookEvents').set({ error: (err as Error).message.slice(0, 500) }).where('id', '=', eventId).execute();
-      throw err; // 500 → Razorpay retries the webhook
+      throw err; // 500 → Cashfree sends the webhook again
     }
   }
 
-  private async applyWebhook(type: string, payload: Record<string, { entity?: Record<string, unknown> }>): Promise<void> {
-    const payment = payload.payment?.entity;
-    const refund = payload.refund?.entity;
-    const transfer = payload.transfer?.entity;
-    if ((type === 'payment.captured' || type === 'order.paid') && payment) {
-      const orderId = String(payment.order_id ?? '');
-      const gp = { id: String(payment.id), orderId, amount: Number(payment.amount), status: 'captured' as const, method: payment.method ? String(payment.method) : null, error: null };
-      const row = await this.dbs.system((tx) => tx.selectFrom('payments').select(['id']).where('razorpayOrderId', '=', orderId).executeTakeFirst());
+  private async applyPaymentWebhook(type: string, data: Record<string, unknown>): Promise<void> {
+    const order = (data.order ?? {}) as Record<string, unknown>;
+    const payment = (data.payment ?? {}) as Record<string, unknown>;
+    const refund = (data.refund ?? {}) as Record<string, unknown>;
+    const orderId = String(order.order_id ?? '');
+    if (type === 'PAYMENT_SUCCESS' && orderId) {
+      const gp: GatewayPayment = {
+        id: String(payment.cf_payment_id ?? ''),
+        orderId,
+        amount: toPaise(payment.payment_amount),
+        status: mapPaymentStatus(payment.payment_status),
+        method: payment.payment_group ? String(payment.payment_group).slice(0, 20) : null,
+        error: null,
+      };
+      if (gp.status !== 'captured' || !gp.id) return;
+      const row = await this.dbs.system((tx) => tx.selectFrom('payments').select(['id']).where('gatewayOrderId', '=', orderId).executeTakeFirst());
       // Not a booking: maybe a ₹99 doctor suggestion ("Find Your Right Doctor").
       if (!row) {
         await this.picks.webhookPaid(orderId, gp);
         return;
       }
       await this.confirm(row.id, gp, 'webhook');
-    } else if (type === 'payment.failed' && payment) {
+    } else if ((type === 'PAYMENT_FAILED' || type === 'PAYMENT_USER_DROPPED') && orderId) {
       await this.dbs.system((tx) =>
         tx
           .updateTable('payments')
-          .set({ failureReason: String(payment.error_description ?? 'failed').slice(0, 300) })
-          .where('razorpayOrderId', '=', String(payment.order_id ?? ''))
+          .set({ failureReason: String(payment.payment_message ?? (type === 'PAYMENT_USER_DROPPED' ? 'closed the payment page' : 'failed')).slice(0, 300) })
+          .where('gatewayOrderId', '=', orderId)
           .where('status', '=', 'created')
           .execute(),
       );
-    } else if ((type === 'refund.processed' || type === 'refund.failed') && refund) {
-      const row = await this.dbs.system((tx) => tx.selectFrom('refunds').select('id').where('razorpayRefundId', '=', String(refund.id)).executeTakeFirst());
-      if (row) await this.dbs.system((tx) => this.markRefund(tx, row.id, type === 'refund.processed' ? 'processed' : 'failed', 'Refused by the bank'));
-    } else if (transfer && type.startsWith('transfer.')) {
-      const id = String(transfer.id);
-      if (type === 'transfer.failed') {
-        await this.dbs.system((tx) => tx.updateTable('transfers').set({ status: 'failed' }).where('razorpayTransferId', '=', id).where('status', '=', 'on_hold').execute());
-      } else if (type === 'transfer.reversed') {
-        await this.dbs.system((tx) =>
-          tx.updateTable('transfers').set({ status: 'reversed', reversedAt: new Date() }).where('razorpayTransferId', '=', id).where('status', 'in', ['on_hold', 'released']).execute(),
-        );
-      }
-    } else if (type === 'account.activated' || type === 'product.route.activated') {
-      const accountId = String((payload.account?.entity?.id as string | undefined) ?? '');
-      if (accountId) {
-        await this.dbs.system((tx) => tx.updateTable('payoutAccounts').set({ status: 'active' }).where('razorpayAccountId', '=', accountId).execute());
-      }
+    } else if (type === 'REFUND_STATUS' && refund.refund_id) {
+      const status = mapRefundStatus(refund.refund_status);
+      if (status === 'pending') return;
+      const row = await this.dbs.system((tx) => tx.selectFrom('refunds').select('id').where('gatewayRefundId', '=', String(refund.refund_id)).executeTakeFirst());
+      if (row) await this.dbs.system((tx) => this.markRefund(tx, row.id, status, 'Refused by the bank'));
     }
+  }
+
+  private async applyPayoutWebhook(type: string, data: Record<string, unknown>): Promise<void> {
+    const transferId = String(data.transfer_id ?? '');
+    const m = /^po_([0-9a-f]{32})$/.exec(transferId);
+    if (!m) {
+      if (type === 'LOW_BALANCE_ALERT') this.log.warn('Cashfree Payouts balance is low: doctor payouts will wait until it is topped up.');
+      return;
+    }
+    const hex = m[1]!;
+    const payoutId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    const status = type === 'TRANSFER_REVERSED' || type === 'TRANSFER_REJECTED' ? 'failed' : mapTransferStatus(data.status);
+    await this.applyPayoutStatus(payoutId, {
+      cfTransferId: data.cf_transfer_id ? String(data.cf_transfer_id) : null,
+      status,
+      utr: data.transfer_utr ? String(data.transfer_utr) : null,
+      reason: status === 'failed' ? String(data.status_description ?? data.status_code ?? type) : null,
+    });
   }
 }

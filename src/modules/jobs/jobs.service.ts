@@ -64,6 +64,7 @@ export class JobsService implements OnApplicationShutdown {
     this.timed('holds.expire', this.env.HOLD_SWEEP_SECONDS, () => this.payments.expireHolds());
     this.timed('refunds.retry', 15 * 60, () => this.payments.retryDueRefunds());
     this.timed('payouts.release', 60 * 60, () => this.payments.releaseDueTransfers());
+    this.timed('payouts.sync', 15 * 60, () => this.payments.syncPendingPayouts());
     this.timed('sessions.auto', 5 * 60, () => this.autoSessions());
     this.timed('emergency.expire', 5 * 60, () => this.expireEmergency());
     this.timed('opd.soon', 5 * 60, () => this.opdSoon());
@@ -182,8 +183,6 @@ export class JobsService implements OnApplicationShutdown {
         return this.deliverNotify(p as unknown as NotifyPayload);
       case 'refund.start':
         return this.payments.runRefund(String(p.refundId));
-      case 'transfer.reverse':
-        return this.payments.runTransferReversal(String(p.transferId));
       case 'live.publish': {
         const s = await this.dbs.db.selectFrom('opdSessions').select(['version']).where('id', '=', String(p.sessionId)).executeTakeFirst();
         if (s) this.bus.publish({ sessionId: String(p.sessionId), version: s.version });

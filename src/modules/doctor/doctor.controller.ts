@@ -198,6 +198,11 @@ export class DoctorController {
     return this.doctors.earnings(d, q.days);
   }
 
+  @Get('payouts')
+  payouts(@CurrentDoctor() d: DoctorIdentity) {
+    return this.doctors.payouts(d);
+  }
+
   @Get('reports')
   reports(@CurrentDoctor() d: DoctorIdentity, @ZQuery(range) q: { days: number }) {
     return this.doctors.reports(d, q.days);

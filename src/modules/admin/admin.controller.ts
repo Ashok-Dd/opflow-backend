@@ -177,9 +177,7 @@ const payoutBody = z.object({
   accountNumber: z.string().regex(/^\d{9,18}$/, 'must be 9–18 digits'),
   accountNumberAgain: z.string(),
   ifsc: z.string().regex(/^[A-Z]{4}0[A-Z0-9]{6}$/, 'must look like SBIN0001234'),
-  pan: z.string().regex(/^[A-Z]{5}\d{4}[A-Z]$/, 'must look like ABCDE1234F'),
-  email: z.email(),
-  address: z.object({ street: z.string().min(3).max(120), city: z.string().min(2).max(60), state: z.string().min(2).max(60), pin: z.string().regex(/^[1-9]\d{5}$/) }),
+  email: z.email().optional(),
 });
 
 @ApiTags('admin: doctors')
@@ -275,6 +273,14 @@ export class AdminDoctorsController {
   payout(@CurrentAdmin() who: AdminPrincipal, @IdParam() id: string, @ZBody(payoutBody) b: z.output<typeof payoutBody>, @Meta() meta: RequestMeta) {
     if (b.accountNumber !== b.accountNumberAgain) throw new AppError('INVALID_INPUT', 'The two account numbers are not the same.', 400);
     return this.doctors.payoutAccount(who, id, b, meta);
+  }
+
+  /** The bank check at Cashfree can finish later: asks again. */
+  @Post('doctors/:id/payout-account/refresh')
+  @Admin('super', 'ops')
+  @HttpCode(200)
+  async refreshPayout(@IdParam() id: string) {
+    return { status: await this.doctors.refreshPayoutAccount(id) };
   }
 
   /** Make the doctor visible to patients (after the checklist). Needs a fresh authenticator code. */
@@ -488,6 +494,22 @@ export class AdminOpsController {
     return this.admin.transfers(q.status, q.doctor, p.limit, p.offset);
   }
 
+  @Get('payouts')
+  @Admin('super', 'finance')
+  payouts(@ZQuery(pageQ.extend({ status: z.enum(['pending', 'success', 'failed']).optional(), doctor: z.uuid().optional() })) q: { status?: string; doctor?: string; cursor?: string; limit: number }) {
+    const p = pg(q);
+    return this.admin.payoutsList(q.status, q.doctor, p.limit, p.offset);
+  }
+
+  /** Pays what is due now (the same as the hourly run). */
+  @Post('payouts/run')
+  @Admin('super', 'finance')
+  @StepUp()
+  @HttpCode(200)
+  runPayouts(@CurrentAdmin() who: AdminPrincipal, @Meta() meta: RequestMeta) {
+    return this.admin.runPayouts(who, meta);
+  }
+
   @Get('reconciliation')
   @Admin('super', 'finance')
   reconciliation(@ZQuery(z.object({ date: zDate })) q: { date: string }) {
@@ -499,7 +521,7 @@ export class AdminOpsController {
   @Header('Content-Type', 'text/csv; charset=utf-8')
   async export(@Param('kind') kind: string, @ZQuery(z.object({ from: zDate, to: zDate })) q: { from: string; to: string }, @Res() res: Response) {
     const k = kind.replace(/\.csv$/, '');
-    if (!['payments', 'refunds', 'transfers'].includes(k)) throw new AppError('NOT_FOUND', 'Unknown export.', 404);
+    if (!['payments', 'refunds', 'transfers', 'payouts'].includes(k)) throw new AppError('NOT_FOUND', 'Unknown export.', 404);
     const csv = await this.admin.exportCsv(k as 'payments', q.from, q.to);
     res.setHeader('Content-Disposition', `attachment; filename="opflow-${k}-${q.from}-to-${q.to}.csv"`);
     res.send(csv);

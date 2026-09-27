@@ -64,7 +64,7 @@ export async function loadBookings(tx: Tx, where: { ids?: string[]; patientUserI
            s.status as session_status, s.ends_at as session_ends_at,
            q.state as queue_state,
            (select json_build_object('status', p.status, 'amountPaise', p.amount_paise, 'method', p.method,
-                                     'orderId', p.razorpay_order_id, 'paymentId', p.razorpay_payment_id)
+                                     'orderId', p.gateway_order_id, 'paymentId', p.gateway_payment_id)
               from payments p where p.booking_id = b.id
              order by (p.status = 'captured') desc, p.abandoned asc, p.created_at desc limit 1) as payment,
            (select json_agg(json_build_object('id', rf.id, 'status', rf.status, 'amountPaise', rf.amount_paise,

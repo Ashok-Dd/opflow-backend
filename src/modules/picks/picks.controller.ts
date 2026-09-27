@@ -7,6 +7,7 @@ import { Idempotent } from '../../common/http/idempotency';
 import { decodeCursor, IdParam, ZBody, zCursor, zLimit, ZQuery } from '../../common/http/zod';
 import { RateLimit } from '../../infra/redis/rate-limit';
 import { PicksService } from './picks.service';
+import { zReturnTo } from '../payments/orders';
 
 const zNear = z
   .string()
@@ -24,12 +25,9 @@ const purchaseBody = z.object({
   place: z.string().trim().max(80).optional(),
   // The patient ticked "I understand this is a recommendation, not a guarantee…" (kept with the purchase).
   consent: z.literal(true, { message: 'Please tick that you understand before paying' }),
+  returnTo: zReturnTo,
 });
-const verifyBody = z.object({
-  razorpay_order_id: z.string().min(5).max(40),
-  razorpay_payment_id: z.string().min(5).max(40),
-  razorpay_signature: z.string().min(10).max(200),
-});
+const verifyBody = z.object({ orderId: z.string().regex(/^[A-Za-z0-9_-]{5,45}$/) });
 const feedbackBody = z.object({ rating: z.number().int().min(1).max(5), note: z.string().trim().max(300).optional() });
 
 /** Patients: "Find Your Right Doctor" (paid one-time suggestion) and private visit feedback. */
@@ -57,14 +55,14 @@ export class PicksController {
   @Idempotent()
   @RateLimit('picks-purchase', 10, 3600, 'user')
   purchase(@PatientId() userId: string, @ZBody(purchaseBody) b: z.output<typeof purchaseBody>) {
-    return this.picks.purchase(userId, { type: b.type, near: b.near, place: b.place });
+    return this.picks.purchase(userId, { type: b.type, near: b.near, place: b.place, returnTo: b.returnTo });
   }
 
   @Post('picks/verify')
   @Roles('patient')
   @HttpCode(200)
   verify(@PatientId() userId: string, @ZBody(verifyBody) b: z.output<typeof verifyBody>) {
-    return this.picks.verify(userId, { orderId: b.razorpay_order_id, paymentId: b.razorpay_payment_id, signature: b.razorpay_signature });
+    return this.picks.verify(userId, { orderId: b.orderId });
   }
 
   /** "Was I charged?" (after the web version's bank page, or an unsure result). Never charges. */

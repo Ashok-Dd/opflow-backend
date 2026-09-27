@@ -15,7 +15,7 @@ import { DOMAIN_IMPORTS } from './app.module';
 import { JobsService } from './modules/jobs/jobs.service';
 
 /**
- * The worker process: same code, no HTTP. Delivers the outbox (pushes, emails, SMS, refunds at Razorpay,
+ * The worker process: same code, no HTTP. Delivers the outbox (pushes, emails, SMS, refunds at Cashfree, doctor payouts,
  * photo resizing) and runs the timed jobs (hold expiry, session generation, payouts, auto-end, checks).
  */
 @Module({ imports: DOMAIN_IMPORTS })

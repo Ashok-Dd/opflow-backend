@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Inject, Post, Query, Req, Res } from '@nestjs/common';
+import { Controller, Get, Headers, HttpCode, HttpStatus, Inject, Post, Query, Req, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { z } from 'zod';
@@ -11,14 +11,13 @@ import { Idempotent } from '../../common/http/idempotency';
 import { IdParam, ZBody } from '../../common/http/zod';
 import { RateLimit } from '../../infra/redis/rate-limit';
 import { PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
+import { PAYOUTS, PayoutsProvider } from '../../infra/payments/payouts';
 import { BookingsService } from '../bookings/bookings.service';
+import { zReturnTo } from './orders';
 import { PaymentsService } from './payments.service';
 
-const verifyBody = z.object({
-  razorpay_order_id: z.string().min(5).max(40),
-  razorpay_payment_id: z.string().min(5).max(40),
-  razorpay_signature: z.string().min(10).max(200),
-});
+const verifyBody = z.object({ orderId: z.string().regex(/^[A-Za-z0-9_-]{5,45}$/) });
+const retryBody = z.object({ returnTo: zReturnTo }).default({});
 
 @ApiTags('payments')
 @Controller('v1')
@@ -27,15 +26,16 @@ export class PaymentsController {
     private readonly payments: PaymentsService,
     private readonly bookings: BookingsService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(PAYOUTS) private readonly payouts: PayoutsProvider,
     @Inject(ENV) private readonly env: Env,
   ) {}
 
-  /** After Razorpay Checkout succeeds: confirms the booking and returns it (with the token). */
+  /** After the Cashfree checkout closes: asks Cashfree about the order, confirms the booking and returns it. */
   @Post('payments/verify')
   @Roles('patient')
   @HttpCode(200)
   async verify(@PatientId() userId: string, @ZBody(verifyBody) body: z.output<typeof verifyBody>) {
-    const r = await this.payments.verify(userId, { orderId: body.razorpay_order_id, paymentId: body.razorpay_payment_id, signature: body.razorpay_signature });
+    const r = await this.payments.verify(userId, { orderId: body.orderId });
     return { outcome: r.outcome, booking: await this.bookings.get(userId, r.bookingId) };
   }
 
@@ -54,53 +54,59 @@ export class PaymentsController {
   @Roles('patient')
   @HttpCode(200)
   @Idempotent()
-  retry(@PatientId() userId: string, @IdParam() bookingId: string) {
-    return this.payments.retry(userId, bookingId);
+  retry(@PatientId() userId: string, @IdParam() bookingId: string, @ZBody(retryBody) b: z.output<typeof retryBody>) {
+    return this.payments.retry(userId, bookingId, b.returnTo);
   }
 
   /**
-   * Razorpay "redirect" mode, used by the web version (iPhone users in Safari): no pop-up windows, which phones
-   * block. After the bank / UPI page Razorpay sends the person here, and we send them straight back to the web app,
-   * which asks the server "was I charged?" (payments/:id/check) — nothing in this request is trusted, and `to` must
-   * be one of OPflow's own web addresses (CORS_ORIGINS), so this can never send anyone to another site.
+   * The web version (iPhone users in Safari) pays on Cashfree's page in the same tab; afterwards Cashfree sends
+   * the person here (the order's return_url), and we send them straight back to the web app, which asks the
+   * server "was I charged?" (payments/:id/check). Nothing in this request is trusted, and `to` must be one of
+   * OPflow's own web addresses (CORS_ORIGINS), so this can never send anyone to another site.
    */
-  @Post('payments/return')
-  @Public()
-  paidReturn(@Query('b') b: string, @Query('p') p: string, @Query('to') to: string, @Body() body: Record<string, unknown> | undefined, @Res() res: Response) {
-    this.sendBack(res, b ?? p, to, typeof body?.razorpay_payment_id === 'string', p ? 'pick-return' : 'pay-return');
-  }
-
   @Get('payments/return')
   @Public()
-  paidReturnGet(@Query('b') b: string, @Query('p') p: string, @Query('to') to: string, @Query('razorpay_payment_id') paymentId: string | undefined, @Res() res: Response) {
-    this.sendBack(res, b ?? p, to, typeof paymentId === 'string', p ? 'pick-return' : 'pay-return');
+  paidReturn(@Query('b') b: string, @Query('p') p: string, @Query('to') to: string, @Res() res: Response) {
+    this.sendBack(res, b ?? p, to, p ? 'pick-return' : 'pay-return');
   }
 
   /** `b` = a booking (/pay-return), `p` = a ₹99 doctor suggestion (/pick-return). */
-  private sendBack(res: Response, bookingId: string, to: string, paid: boolean, screen: 'pay-return' | 'pick-return') {
+  private sendBack(res: Response, bookingId: string, to: string, screen: 'pay-return' | 'pick-return') {
     const ownSite = typeof to === 'string' && this.env.CORS_ORIGINS.includes(to.replace(/\/$/, ''));
     if (!ownSite || typeof bookingId !== 'string' || !/^[0-9a-f-]{36}$/i.test(bookingId)) {
       throw new AppError('BAD_RETURN', 'This payment link is not valid. Please open OPflow and check My bookings.', HttpStatus.BAD_REQUEST);
     }
     const key = screen === 'pick-return' ? 'p' : 'b';
-    res.redirect(303, `${to.replace(/\/$/, '')}/#/${screen}?${key}=${bookingId}&ok=${paid ? 1 : 0}`);
+    // ok=1: "maybe paid" — the app keeps asking the server a little longer before it says "not paid".
+    res.redirect(303, `${to.replace(/\/$/, '')}/#/${screen}?${key}=${bookingId}&ok=1`);
   }
 
   /**
-   * Razorpay webhooks (Dashboard → Webhooks → {API_PUBLIC_URL}/v1/webhooks/razorpay). The signature is
-   * checked on the exact bytes received. Each event is applied once, even if Razorpay sends it again.
+   * Cashfree webhooks. Payment Gateway (Developers → Webhooks → {API_PUBLIC_URL}/v1/webhooks/cashfree) and Payouts
+   * (V2 webhooks → {API_PUBLIC_URL}/v1/webhooks/cashfree-payouts). The signature (timestamp + exact bytes) is
+   * checked with each product's secret. Each event is applied once, even if Cashfree sends it again.
    */
-  @Post('webhooks/razorpay')
+  @Post('webhooks/cashfree')
   @Public()
   @HttpCode(200)
-  async webhook(@Req() req: AuthedRequest, @Headers('x-razorpay-signature') signature?: string, @Headers('x-razorpay-event-id') eventId?: string) {
+  async webhook(@Req() req: AuthedRequest, @Headers('x-webhook-signature') signature?: string, @Headers('x-webhook-timestamp') timestamp?: string) {
+    return this.receive(req, 'payments', signature, timestamp);
+  }
+
+  @Post('webhooks/cashfree-payouts')
+  @Public()
+  @HttpCode(200)
+  async payoutWebhook(@Req() req: AuthedRequest, @Headers('x-webhook-signature') signature?: string, @Headers('x-webhook-timestamp') timestamp?: string) {
+    return this.receive(req, 'payouts', signature, timestamp);
+  }
+
+  private async receive(req: AuthedRequest, source: 'payments' | 'payouts', signature?: string, timestamp?: string) {
     const raw = req.rawBody;
-    if (!raw || !signature || !this.gateway.verifyWebhookSignature(raw, signature)) {
-      throw new AppError('BAD_SIGNATURE', 'Signature check failed.', HttpStatus.BAD_REQUEST);
-    }
-    const event = JSON.parse(raw.toString('utf8')) as { event?: string; created_at?: number; payload?: Record<string, { entity?: Record<string, unknown> }> };
-    const id = eventId ?? `sha256:${sha256(raw).toString('hex').slice(0, 56)}`;
-    await this.payments.handleWebhook(id.slice(0, 64), event);
+    const ok = !!raw && !!signature && !!timestamp &&
+      (source === 'payments' ? this.gateway.verifyWebhookSignature(raw, signature, timestamp) : this.payouts.verifyWebhookSignature(raw, signature, timestamp));
+    if (!ok) throw new AppError('BAD_SIGNATURE', 'Signature check failed.', HttpStatus.BAD_REQUEST);
+    const event = JSON.parse(raw.toString('utf8')) as { type?: string; data?: Record<string, unknown> };
+    await this.payments.handleWebhook(`cf:${sha256(raw).toString('hex').slice(0, 60)}`, source, event);
     return { ok: true };
   }
 }

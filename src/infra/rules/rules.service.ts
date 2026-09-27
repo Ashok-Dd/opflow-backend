@@ -58,6 +58,8 @@ export class RulesService {
   holdMinutes = () => this.num('hold_minutes', 10);
   maxOpenHolds = () => this.num('max_open_holds', 2);
   payoutHoldHours = () => this.num('payout_hold_hours', 24);
+  /** Smallest bank payout to a doctor (smaller amounts wait for the next run). */
+  payoutsMinPaise = () => this.num('payouts.min_paise', 10000);
   noShowAfterMinutes = () => this.num('no_show_after_minutes', 60);
   movePickHours = () => this.num('move_pick_hours', 48);
   doctorMaxDevices = () => this.num('doctor.max_devices', 2);

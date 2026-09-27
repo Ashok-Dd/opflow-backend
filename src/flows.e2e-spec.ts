@@ -73,8 +73,8 @@ run('OPflow end to end', () => {
 
   async function holdAndPay(token: string, windowId: string) {
     const h = await api().post('/v1/bookings/hold').set(bearer(token)).set('Idempotency-Key', randomUUID()).send({ windowId }).expect(201);
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
-    const v = await api().post('/v1/payments/verify').set(bearer(token)).send(paid.body).expect(200);
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    const v = await api().post('/v1/payments/verify').set(bearer(token)).send({ orderId: paid.body.orderId }).expect(200);
     return { hold: h.body, verify: v.body };
   }
 
@@ -95,6 +95,8 @@ run('OPflow end to end', () => {
     process.env.JOBS_IN_API = 'false';
     process.env.LOG_LEVEL = 'error';
     process.env.STORAGE_PROVIDER = 'local';
+    // Always the built-in Cashfree stand-ins here, even if real sandbox keys are in .env.
+    for (const k of ['CASHFREE_CLIENT_ID', 'CASHFREE_CLIENT_SECRET', 'CASHFREE_PAYOUT_CLIENT_ID', 'CASHFREE_PAYOUT_CLIENT_SECRET', 'CASHFREE_PAYOUT_PUBLIC_KEY_B64']) process.env[k] = '';
     const mod = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = mod.createNestApplication({ rawBody: true, logger: ['error'] });
     await app.init();
@@ -353,14 +355,21 @@ run('OPflow end to end', () => {
     const mismatch = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', key).send({ windowId: windows.find((w) => w.id !== first.id)!.id });
     expect(mismatch.body.error.code).toBe('IDEMPOTENCY_MISMATCH');
 
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
-    const forged = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ ...paid.body, razorpay_signature: 'f'.repeat(64) });
-    expect(forged.body.error.code).toBe('PAYMENT_NOT_VERIFIED');
-    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    // The app opens Cashfree's checkout with the order and its session; the server alone decides "paid".
+    expect(h.body.payment).toMatchObject({ orderId: expect.stringMatching(/^op_[0-9a-f]{32}$/), paymentSessionId: expect.any(String), environment: 'sandbox', fake: true });
+    const early = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: h.body.payment.orderId }).expect(200);
+    expect(early.body.outcome).toBe('processing'); // closed the page before paying: not "paid", not "failed"
+    const unknown = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: `op_${'f'.repeat(32)}` });
+    expect(unknown.body.error.code).toBe('PAYMENT_NOT_FOUND');
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    // Someone else's order: not found (row security), even with a real order id.
+    const stranger = await api().post('/v1/payments/verify').set(bearer(s.patients[1]!.token)).send({ orderId: paid.body.orderId });
+    expect(stranger.body.error.code).toBe('PAYMENT_NOT_FOUND');
+    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: paid.body.orderId }).expect(200);
     expect(v.body.outcome).toBe('confirmed');
     expect(v.body.booking.status).toBe('confirmed');
     expect(v.body.booking.tokenLabel).toMatch(/^\d{2,3}$/);
-    const again = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    const again = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: paid.body.orderId }).expect(200);
     expect(again.body.outcome).toBe('already');
     Object.assign(s, { bookingId: v.body.booking.id, bookingCode: v.body.booking.code, sessionId: v.body.booking.sessionId });
 
@@ -428,14 +437,26 @@ run('OPflow end to end', () => {
     const p = s.patients[1]!;
     const windows = await bookableWindows();
     const h = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', randomUUID()).send({ windowId: windows[0]!.id }).expect(201);
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
-    const event = JSON.stringify({ event: 'payment.captured', created_at: 1, payload: { payment: { entity: { id: paid.body.razorpay_payment_id, order_id: h.body.payment.orderId, amount: 50000, status: 'captured', method: 'upi' } } } });
-    const sig = await api().post('/v1/dev/razorpay/sign').set('Content-Type', 'application/json').send(event).expect(200);
-    await api().post('/v1/webhooks/razorpay').set('Content-Type', 'application/json').set('x-razorpay-signature', 'bad').send(event).expect(400);
-    const eventId = `evt_${randomUUID().slice(0, 8)}`;
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    const event = JSON.stringify({
+      data: {
+        order: { order_id: h.body.payment.orderId, order_amount: 500.0, order_currency: 'INR' },
+        payment: { cf_payment_id: Number(paid.body.paymentId), payment_status: 'SUCCESS', payment_amount: 500.0, payment_group: 'upi' },
+      },
+      event_time: new Date().toISOString(),
+      type: 'PAYMENT_SUCCESS_WEBHOOK',
+    });
+    const sig = await api().post('/v1/dev/cashfree/sign').set('Content-Type', 'application/json').send(event).expect(200);
+    const hook = () => api().post('/v1/webhooks/cashfree').set('Content-Type', 'application/json').set('x-webhook-timestamp', sig.body.timestamp);
+    await hook().set('x-webhook-signature', 'bad').send(event).expect(400);
+    // Signed for the other product (payouts): refused too.
+    const wrong = await api().post('/v1/dev/cashfree/sign?for=payouts').set('Content-Type', 'application/json').set('x-webhook-timestamp', sig.body.timestamp).send(event).expect(200);
+    await hook().set('x-webhook-signature', wrong.body.signature).send(event).expect(400);
     for (let i = 0; i < 2; i++) {
-      await api().post('/v1/webhooks/razorpay').set('Content-Type', 'application/json').set('x-razorpay-signature', sig.body.signature).set('x-razorpay-event-id', eventId).send(event).expect(200);
+      await hook().set('x-webhook-signature', sig.body.signature).send(event).expect(200);
     }
+    const stored = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from webhook_events where payload->'data'->'order'->>'order_id' = ${h.body.payment.orderId}`);
+    expect(stored.rows[0]!.n).toBe(1); // the same event twice is stored and applied once
     const b = await api().get(`/v1/bookings/${h.body.booking.id}`).set(bearer(p.token)).expect(200);
     expect(b.body.status).toBe('confirmed');
   });
@@ -448,8 +469,8 @@ run('OPflow end to end', () => {
     await api().post('/v1/dev/jobs/holds.expire').expect(200);
     const expired = await api().get(`/v1/bookings/${h.body.booking.id}`).set(bearer(p.token)).expect(200);
     expect(expired.body.status).toBe('expired');
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
-    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: paid.body.orderId }).expect(200);
     expect(v.body.outcome).toBe('confirmed');
     expect(v.body.booking.status).toBe('confirmed');
   });
@@ -462,8 +483,8 @@ run('OPflow end to end', () => {
     // Before paying: not paid, still waiting for payment.
     const before = await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
     expect(before.body).toMatchObject({ status: 'pending_payment', paid: false });
-    // The money is taken at Razorpay, but the app never calls verify.
-    await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    // The money is taken at Cashfree, but the app never calls verify.
+    await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
     const after = await api().post(`/v1/payments/${bookingId}/check`).set(bearer(p.token)).expect(200);
     expect(after.body).toMatchObject({ status: 'confirmed', paid: true });
     expect(after.body.booking.token).toBeGreaterThan(0);
@@ -489,11 +510,11 @@ run('OPflow end to end', () => {
     expect(older.body.items.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('if Razorpay is down, no place is kept and no money is taken', async () => {
+  it('if Cashfree is down, no place is kept and no money is taken', async () => {
     const p = s.patients[3]!;
     const windows = await bookableWindows();
     const before = windows[0]!.free;
-    await api().post('/v1/dev/razorpay/fail-next-order').expect(200);
+    await api().post('/v1/dev/cashfree/fail-next-order').expect(200);
     const r = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', randomUUID()).send({ windowId: windows[0]!.id });
     expect(r.status).toBe(503);
     expect(r.body.error).toMatchObject({ code: 'PAYMENTS_UNAVAILABLE', retryable: true });
@@ -523,8 +544,8 @@ run('OPflow end to end', () => {
     if (h.status === 409 && h.body.error.code === 'EMERGENCY_NOT_AVAILABLE') return; // only at 23:50–24:00 IST
     expect(h.status).toBe(201);
     expect(h.body.payment.amount.paise).toBe(60000);
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
-    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: h.body.payment.orderId }).expect(200);
+    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: paid.body.orderId }).expect(200);
     expect(v.body.booking.tokenLabel).toBe('E1');
     expect(v.body.booking.total.paise).toBe(60000);
     s.emergencyBookingId = v.body.booking.id;
@@ -746,8 +767,8 @@ run('OPflow end to end', () => {
     expect(again.body.booking.id).not.toBe(first.body.booking.id);
     const old = await dbs.sys(sql<{ status: string }>`select status from bookings where id = ${first.body.booking.id}`);
     expect(old.rows[0]!.status).toBe('expired');
-    const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: again.body.payment.orderId }).expect(200);
-    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send(paid.body).expect(200);
+    const paid = await api().post('/v1/dev/cashfree/pay').send({ orderId: again.body.payment.orderId }).expect(200);
+    const v = await api().post('/v1/payments/verify').set(bearer(p.token)).send({ orderId: paid.body.orderId }).expect(200);
     expect(v.body.booking.status).toBe('confirmed');
   });
 
@@ -785,8 +806,13 @@ run('OPflow end to end', () => {
     expect(told.rows[0]!.n).toBe(1);
 
     // Payouts: due by time, but the visits are still open → nothing is sent.
-    await dbs.sys(sql`insert into payout_accounts (doctor_id, razorpay_account_id, status) values (${s.doctorId}, 'acc_test_doctor', 'active')
-                      on conflict (doctor_id) do update set status = 'active', razorpay_account_id = excluded.razorpay_account_id`);
+    const bankFresh = await stepUp(s.superToken, s.superId, s.superSecret);
+    const bank = { holderName: 'Dr Test Doctor', accountNumber: '123456789012', accountNumberAgain: '123456789012', ifsc: 'SBIN0001234' };
+    await api().post(`/v1/admin/doctors/${s.doctorId}/payout-account`).set(bearer(bankFresh)).send({ ...bank, accountNumberAgain: '1' }).expect(400);
+    const acc = await api().post(`/v1/admin/doctors/${s.doctorId}/payout-account`).set(bearer(bankFresh)).send(bank).expect(200);
+    expect(acc.body).toEqual({ status: 'active', bankLast4: '9012' });
+    // Keep this test's two visits apart from any other visit already due.
+    await dbs.sys(sql`update transfers set release_at = now() + interval '30 days' where doctor_id = ${s.doctorId} and status = 'on_hold'`);
     const ids = [first.id, second.id];
     await dbs.sys(sql`update transfers t set release_at = now() - interval '1 minute' from payments p where p.id = t.payment_id and p.booking_id = any(${ids}::uuid[])`);
     await payments.releaseDueTransfers();
@@ -798,9 +824,62 @@ run('OPflow end to end', () => {
     // The doctor ends the OPD: seen → completed, not come → no-show; both are paid out now.
     const end = await api().post(`/v1/doctor/sessions/${sessionId}/end`).set(bearer(s.doctorToken)).send({ leftovers: 'move' });
     expect(end.status).toBeLessThan(300);
-    await payments.releaseDueTransfers();
+    const run = await payments.releaseDueTransfers();
+    expect(run.payouts).toBe(1); // ONE bank payout for both visits
     expect(await payout(second.id)).toBe('released');
     expect(await payout(first.id)).toBe('released');
+    const po = (await dbs.sys(sql<{ id: string; amountPaise: number; status: string; utr: string | null }>`
+      select po.id, po.amount_paise, po.status, po.utr from payouts po join transfers t on t.payout_id = po.id join payments p on p.id = t.payment_id
+       where p.booking_id = ${first.id}`)).rows[0]!;
+    expect(po).toMatchObject({ amountPaise: 90000, status: 'success' });
+    expect(po.utr).toBeTruthy();
+    for (let i = 0; i < 15; i++) await jobs.relay();
+    const sent = await dbs.sys(sql<{ n: number }>`select count(*)::int as n from notifications where title = 'Money sent to your bank' and body like ${'%₹900%'}`);
+    expect(sent.rows[0]!.n).toBe(1);
+
+    // A cancel after the payout: the money is taken from the doctor's NEXT payout (a bank payout can't be pulled back).
+    await dbs.sys(sql`update transfers t set status = 'reversed', reversed_at = now(), recover_paise = t.amount_paise
+                       from payments p where p.id = t.payment_id and p.booking_id = ${second.id}`);
+    // The doctor's next visits: one due visit worth 45000 minus 45000 owed would leave nothing, so it waits…
+    // A window on a day this patient has not booked with the doctor (one booking per doctor per day).
+    const openFor = async (pid: string) => {
+      const days = new Set(
+        (await dbs.sys(sql<{ sessionId: string }>`select session_id from bookings where patient_user_id = ${pid} and status in ('pending_payment', 'confirmed', 'completed', 'no_show')`)).rows.map((r) => r.sessionId),
+      );
+      const dates = new Set((await dbs.sys(sql<{ date: string }>`select date::text as date from opd_sessions where id = any(${[...days]}::uuid[])`)).rows.map((r) => r.date));
+      for (const x of await bookableWindows()) {
+        const d = (await dbs.sys(sql<{ date: string }>`select date::text as date from opd_sessions where id = ${x.sessionId}`)).rows[0]!.date;
+        if (x.free > 0 && !dates.has(d)) return x.id;
+      }
+      throw new Error('no free window for this patient');
+    };
+    const pn = s.patients[3]!;
+    const pl = s.patients[7]!;
+    const next = (await holdAndPay(pn.token, await openFor(pn.id))).verify.booking;
+    await dbs.sys(sql`update bookings set status = 'completed' where id = ${next.id}`);
+    await dbs.sys(sql`update transfers t set release_at = now() - interval '1 minute' from payments p where p.id = t.payment_id and p.booking_id = ${next.id}`);
+    await dbs.sys(sql`update app_config set value = '100'::jsonb where key = 'payouts.min_paise'`);
+    const small = await payments.releaseDueTransfers();
+    expect(small.payouts).toBe(0);
+    // …a second finished visit makes 90000 − 45000 = 45000: paid, with the deduction recorded.
+    const later = (await holdAndPay(pl.token, await openFor(pl.id))).verify.booking;
+    await dbs.sys(sql`update bookings set status = 'completed' where id = ${later.id}`);
+    await dbs.sys(sql`update transfers t set release_at = now() - interval '1 minute' from payments p where p.id = t.payment_id and p.booking_id = ${later.id}`);
+    // The bank refuses this payout: the visits go back on hold and the deduction is owed again.
+    await api().post('/v1/dev/payouts/fail-next').expect(200);
+    const refused = await payments.releaseDueTransfers();
+    expect(refused.payouts).toBe(1);
+    expect(await payout(next.id)).toBe('on_hold');
+    const owed = await dbs.sys(sql<{ recover: number }>`select t.recover_paise as recover from transfers t join payments p on p.id = t.payment_id where p.booking_id = ${second.id}`);
+    expect(owed.rows[0]!.recover).toBe(45000);
+    // Next run pays it.
+    const again = await payments.releaseDueTransfers();
+    expect(again.payouts).toBe(1);
+    const paidOut = (await dbs.sys(sql<{ amountPaise: number; deductedPaise: number; status: string }>`
+      select amount_paise, deducted_paise, status from payouts where doctor_id = ${s.doctorId} order by created_at desc limit 1`)).rows[0]!;
+    expect(paidOut).toEqual({ amountPaise: 45000, deductedPaise: 45000, status: 'success' });
+    expect(await payout(next.id)).toBe('released');
+    await dbs.sys(sql`update app_config set value = '10000'::jsonb where key = 'payouts.min_paise'`);
   });
 
   it('doctor forgets END OPD: closed after 3 hours; passed-over = did not come, never reached = pick a new time', async () => {
@@ -954,13 +1033,13 @@ run('OPflow end to end', () => {
     await buy(patient, {}).expect(400);
     const order = (await buy(patient, { consent: true, place: 'Brodipet, Guntur' }).expect(201)).body;
     expect(order.payment.amount.paise).toBe(9900);
-    const paid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: order.payment.orderId }).expect(200)).body;
-    const done = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200)).body;
+    const paid = (await api().post('/v1/dev/cashfree/pay').send({ orderId: order.payment.orderId }).expect(200)).body;
+    const done = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send({ orderId: paid.orderId }).expect(200)).body;
     expect(done.status).toBe('paid');
     expect(done.doctors.length).toBeGreaterThanOrEqual(1);
     expect(done.doctors.find((x: { doctor: { id: string } }) => x.doctor.id === s.doctorId)).toMatchObject({ reasons: ['MD General Medicine', '12 years of practice'] });
     // Again, or from the webhook later: still one result, paid once.
-    await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200);
+    await api().post('/v1/picks/verify').set(bearer(patient.token)).send({ orderId: paid.orderId }).expect(200);
     const mine = (await api().get('/v1/picks/mine').set(bearer(patient.token)).expect(200)).body;
     expect(mine.items.find((x: { id: string }) => x.id === order.purchase.id)).toMatchObject({ status: 'paid', count: done.doctors.length });
     // Another patient can never open it.
@@ -968,7 +1047,7 @@ run('OPflow end to end', () => {
 
     // 4. Paid but the phone never came back: "check" finds the payment and makes the list.
     const lost = (await buy(patient, { consent: true }).expect(201)).body;
-    await api().post('/v1/dev/razorpay/pay').send({ orderId: lost.payment.orderId }).expect(200);
+    await api().post('/v1/dev/cashfree/pay').send({ orderId: lost.payment.orderId }).expect(200);
     const checked = (await api().post(`/v1/picks/${lost.purchase.id}/check`).set(bearer(patient.token)).expect(200)).body;
     expect(checked.status).toBe('paid');
 
@@ -976,8 +1055,8 @@ run('OPflow end to end', () => {
     const late = (await buy(patient, { consent: true }).expect(201)).body;
     const open = (await dbs.sys(sql<{ id: string }>`update doctors set bookings_paused = true, bookings_paused_at = now()
                                                      where type_id = ${type} and not bookings_paused returning id`)).rows.map((r) => r.id);
-    const latePaid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: late.payment.orderId }).expect(200)).body;
-    const back = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(latePaid).expect(200)).body;
+    const latePaid = (await api().post('/v1/dev/cashfree/pay').send({ orderId: late.payment.orderId }).expect(200)).body;
+    const back = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send({ orderId: latePaid.orderId }).expect(200)).body;
     await dbs.sys(sql`update doctors set bookings_paused = false, bookings_paused_at = null where id = any(${open})`);
     expect(back.status).toBe('refunded');
     expect(back.doctors).toHaveLength(0);

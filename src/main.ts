@@ -18,7 +18,7 @@ import { AppModule } from './app.module';
 import { ENV, Env } from './config/env';
 
 async function bootstrap() {
-  // rawBody: Razorpay webhook signatures are checked on the exact bytes received.
+  // rawBody: Cashfree webhook signatures are checked on the exact bytes received.
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true, rawBody: true });
   app.useBodyParser('json', { limit: '200kb' });
   const env = app.get<Env>(ENV);

@@ -7,9 +7,10 @@ import { Idempotent } from '../../common/http/idempotency';
 import { decodeCursor, encodeCursor, IdParam, ZBody, zCursor, zLimit, ZQuery } from '../../common/http/zod';
 import { RateLimit } from '../../infra/redis/rate-limit';
 import { BookingsService } from './bookings.service';
+import { zReturnTo } from '../payments/orders';
 
-const holdBody = z.object({ windowId: z.uuid(), note: z.string().trim().max(140).optional() });
-const emergencyBody = z.object({ doctorId: z.uuid() });
+const holdBody = z.object({ windowId: z.uuid(), note: z.string().trim().max(140).optional(), returnTo: zReturnTo });
+const emergencyBody = z.object({ doctorId: z.uuid(), returnTo: zReturnTo });
 const rescheduleBody = z.object({ windowId: z.uuid() });
 const listQuery = z.object({ tab: z.enum(['upcoming', 'past']).default('upcoming'), cursor: zCursor, limit: zLimit });
 
@@ -19,7 +20,7 @@ const listQuery = z.object({ tab: z.enum(['upcoming', 'past']).default('upcoming
 export class BookingsController {
   constructor(private readonly bookings: BookingsService) {}
 
-  /** Keep a place for 10 minutes and get a Razorpay order to pay for it. */
+  /** Keep a place for 10 minutes and get a Cashfree order to pay for it. */
   @Post('hold')
   @Idempotent()
   @RateLimit('hold', 10, 60)
@@ -32,7 +33,7 @@ export class BookingsController {
   @Idempotent()
   @RateLimit('hold', 10, 60)
   emergency(@PatientId() userId: string, @ZBody(emergencyBody) body: z.output<typeof emergencyBody>, @Headers('idempotency-key') key?: string) {
-    return this.bookings.holdEmergency(userId, body.doctorId, key);
+    return this.bookings.holdEmergency(userId, body.doctorId, key, body.returnTo);
   }
 
   @Get()
