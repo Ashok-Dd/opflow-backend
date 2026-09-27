@@ -89,6 +89,12 @@ export class PicksService {
 
   // ── Patient ──────────────────────────────────────────────────────────────────────────────────────
 
+  /** For the Home card: whether the feature is on, and its price (set by the admin). */
+  async info() {
+    const [enabled, pricePaise] = await Promise.all([this.rules.picksEnabled(), this.rules.picksPricePaise()]);
+    return { enabled, price: money(pricePaise), max: MAX_PICKS };
+  }
+
   /** Before paying: the price, how OPflow recommends, and how many doctors it can suggest here (0 = don't pay). */
   async offer(typeId: string, near: Near) {
     const [enabled, pricePaise, criteria] = await Promise.all([this.rules.picksEnabled(), this.rules.picksPricePaise(), this.rules.picksCriteria()]);

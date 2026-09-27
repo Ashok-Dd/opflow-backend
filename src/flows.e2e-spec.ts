@@ -932,6 +932,8 @@ run('OPflow end to end', () => {
     const buy = (who: { token: string }, body: Record<string, unknown>) =>
       api().post('/v1/picks/purchase').set(bearer(who.token)).set('Idempotency-Key', randomUUID()).send({ type, near, ...body });
 
+    const info = (await api().get('/v1/picks/info').set(bearer(patient.token)).expect(200)).body;
+    expect(info).toMatchObject({ enabled: true, price: { paise: 9900 }, max: 3 });
     // 1. Nothing picked yet: the offer says 0 and buying is refused (nobody pays for an empty list).
     const none = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
     expect(none.body).toMatchObject({ enabled: true, available: 0, price: { paise: 9900 } });

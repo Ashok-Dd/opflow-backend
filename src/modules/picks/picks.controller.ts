@@ -38,6 +38,13 @@ const feedbackBody = z.object({ rating: z.number().int().min(1).max(5), note: z.
 export class PicksController {
   constructor(private readonly picks: PicksService) {}
 
+  /** The Home card: on or off, and the price. */
+  @Get('picks/info')
+  @Roles('patient')
+  info() {
+    return this.picks.info();
+  }
+
   /** Before paying: price, "How we recommend", and how many doctors OPflow can suggest near the patient. */
   @Get('picks/offer')
   @Roles('patient')
