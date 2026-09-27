@@ -104,7 +104,12 @@ export class PaymentsController {
     const raw = req.rawBody;
     const ok = !!raw && !!signature && !!timestamp &&
       (source === 'payments' ? this.gateway.verifyWebhookSignature(raw, signature, timestamp) : this.payouts.verifyWebhookSignature(raw, signature, timestamp));
-    if (!ok) throw new AppError('BAD_SIGNATURE', 'Signature check failed.', HttpStatus.BAD_REQUEST);
+    if (!ok) {
+      // Never acted on. Answered 200 so Cashfree's "Test & Add" can save the address; kept (briefly) so a wrong
+      // key or dashboard mode can be found. The payment itself is still confirmed by the app's check and the sweeper.
+      await this.payments.recordRejectedWebhook(source, raw, signature, timestamp);
+      return { ok: false, ignored: 'signature' };
+    }
     const event = JSON.parse(raw.toString('utf8')) as { type?: string; data?: Record<string, unknown> };
     await this.payments.handleWebhook(`cf:${sha256(raw).toString('hex').slice(0, 60)}`, source, event);
     return { ok: true };

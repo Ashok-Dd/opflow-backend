@@ -448,10 +448,10 @@ run('OPflow end to end', () => {
     });
     const sig = await api().post('/v1/dev/cashfree/sign').set('Content-Type', 'application/json').send(event).expect(200);
     const hook = () => api().post('/v1/webhooks/cashfree').set('Content-Type', 'application/json').set('x-webhook-timestamp', sig.body.timestamp);
-    await hook().set('x-webhook-signature', 'bad').send(event).expect(400);
+    expect((await hook().set('x-webhook-signature', 'bad').send(event).expect(200)).body).toEqual({ ok: false, ignored: 'signature' });
     // Signed for the other product (payouts): refused too.
     const wrong = await api().post('/v1/dev/cashfree/sign?for=payouts').set('Content-Type', 'application/json').set('x-webhook-timestamp', sig.body.timestamp).send(event).expect(200);
-    await hook().set('x-webhook-signature', wrong.body.signature).send(event).expect(400);
+    expect((await hook().set('x-webhook-signature', wrong.body.signature).send(event).expect(200)).body.ok).toBe(false);
     for (let i = 0; i < 2; i++) {
       await hook().set('x-webhook-signature', sig.body.signature).send(event).expect(200);
     }

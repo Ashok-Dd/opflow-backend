@@ -740,6 +740,23 @@ export class PaymentsService {
     }
   }
 
+  /** A webhook whose signature did not check out: stored as already handled (never applied), for diagnosis. */
+  async recordRejectedWebhook(source: 'payments' | 'payouts', raw: Buffer | undefined, signature?: string, timestamp?: string): Promise<void> {
+    this.log.warn(`Cashfree ${source} webhook with a bad signature ignored (wrong key or dashboard mode?)`);
+    const body = raw?.toString('utf8').slice(0, 20_000) ?? '';
+    let type = 'unknown';
+    try {
+      type = String((JSON.parse(body) as { type?: string }).type ?? 'unknown');
+    } catch {
+      type = 'not-json';
+    }
+    await sql`insert into webhook_events (id, provider, type, payload, processed_at, error)
+              values (${`bad:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`}, ${`rejected-${source}`.slice(0, 20)}, ${type.slice(0, 60)},
+                      ${JSON.stringify({ body, signature: signature ?? null, timestamp: timestamp ?? null })}, now(), 'bad signature')`
+      .execute(this.dbs.db)
+      .catch(() => undefined);
+  }
+
   private async applyPaymentWebhook(type: string, data: Record<string, unknown>): Promise<void> {
     const order = (data.order ?? {}) as Record<string, unknown>;
     const payment = (data.payment ?? {}) as Record<string, unknown>;
