@@ -1,4 +1,4 @@
-import { constants, publicEncrypt, randomBytes } from 'node:crypto';
+import { constants, createHmac, publicEncrypt, randomBytes } from 'node:crypto';
 
 import { HttpStatus } from '@nestjs/common';
 
@@ -37,6 +37,14 @@ export interface PayoutsProvider {
   transfer(transferId: string, beneficiaryId: string, amountPaise: number, remarks: string): Promise<PayoutTransfer>;
   transferStatus(transferId: string): Promise<PayoutTransfer>;
   verifyWebhookSignature(rawBody: Buffer, signature: string, timestamp: string): boolean;
+  /** Payouts "V1" webhooks (and low-balance alerts): the signature is a field of the body itself. */
+  verifyV1Signature(fields: Record<string, string>): boolean;
+}
+
+/** V1: base64(HMAC-SHA256(the other fields' values, sorted by field name, joined, secret)). */
+export function v1Signature(secret: string, fields: Record<string, string>): string {
+  const data = Object.keys(fields).filter((k) => k !== 'signature').sort().map((k) => fields[k]).join('');
+  return createHmac('sha256', secret).update(data).digest('base64');
 }
 
 export const PAYOUTS = Symbol('PAYOUTS');
@@ -165,6 +173,10 @@ export class CashfreePayouts implements PayoutsProvider {
   verifyWebhookSignature(rawBody: Buffer, signature: string, timestamp: string): boolean {
     return safeEqual(webhookSignature(this.env.CASHFREE_PAYOUT_CLIENT_SECRET!, timestamp, rawBody), signature);
   }
+
+  verifyV1Signature(fields: Record<string, string>): boolean {
+    return !!fields.signature && safeEqual(v1Signature(this.env.CASHFREE_PAYOUT_CLIENT_SECRET!, fields), fields.signature);
+  }
 }
 
 // ── Local fake ─────────────────────────────────────────────────────────────────────────────────────
@@ -216,5 +228,9 @@ export class FakePayouts implements PayoutsProvider {
 
   verifyWebhookSignature(rawBody: Buffer, signature: string, timestamp: string): boolean {
     return safeEqual(webhookSignature(FAKE_PAYOUT_WEBHOOK_SECRET, timestamp, rawBody), signature);
+  }
+
+  verifyV1Signature(fields: Record<string, string>): boolean {
+    return !!fields.signature && safeEqual(v1Signature(FAKE_PAYOUT_WEBHOOK_SECRET, fields), fields.signature);
   }
 }

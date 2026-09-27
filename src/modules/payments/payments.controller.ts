@@ -102,6 +102,14 @@ export class PaymentsController {
 
   private async receive(req: AuthedRequest, source: 'payments' | 'payouts', signature?: string, timestamp?: string) {
     const raw = req.rawBody;
+    // Payouts V1 (and low-balance alerts): no signature headers; the signature is a field of the body.
+    if (source === 'payouts' && !signature && raw) {
+      const fields = v1Fields(raw);
+      if (fields && this.payouts.verifyV1Signature(fields)) {
+        await this.payments.handleWebhook(`cf:${sha256(raw).toString('hex').slice(0, 60)}`, 'payouts', v1ToV2(fields));
+        return { ok: true };
+      }
+    }
     const ok = !!raw && !!signature && !!timestamp &&
       (source === 'payments' ? this.gateway.verifyWebhookSignature(raw, signature, timestamp) : this.payouts.verifyWebhookSignature(raw, signature, timestamp));
     if (!ok) {
@@ -114,4 +122,33 @@ export class PaymentsController {
     await this.payments.handleWebhook(`cf:${sha256(raw).toString('hex').slice(0, 60)}`, source, event);
     return { ok: true };
   }
+}
+
+/** A Payouts V1 body (JSON or form fields) as plain strings, or null. */
+function v1Fields(raw: Buffer): Record<string, string> | null {
+  const text = raw.toString('utf8');
+  try {
+    const j = JSON.parse(text) as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(j).map(([k, v]) => [k, v === null || v === undefined ? '' : String(v)]));
+  } catch {
+    const f = Object.fromEntries(new URLSearchParams(text));
+    return Object.keys(f).length ? f : null;
+  }
+}
+
+/** V1 names → the V2 shape the service reads (event → type; transferId → transfer_id; …). */
+function v1ToV2(f: Record<string, string>): { type: string; data: Record<string, unknown> } {
+  const event = f.event ?? 'unknown';
+  const status = event === 'TRANSFER_SUCCESS' ? 'SUCCESS' : event === 'TRANSFER_FAILED' ? 'FAILED' : event === 'TRANSFER_REVERSED' ? 'REVERSED' : event === 'TRANSFER_REJECTED' ? 'REJECTED' : event;
+  return {
+    type: event,
+    data: {
+      transfer_id: f.transferId,
+      cf_transfer_id: f.referenceId,
+      status,
+      transfer_utr: f.utr,
+      status_description: f.reason,
+      current_balance: f.currentBalance,
+    },
+  };
 }
