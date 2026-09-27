@@ -1,9 +1,11 @@
-import { Controller, Headers, HttpCode, HttpStatus, Inject, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Inject, Post, Query, Req, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
+import type { Response } from 'express';
 import { z } from 'zod';
 
 import { AuthedRequest, PatientId, Public, Roles } from '../../common/auth/auth.decorators';
 import { sha256 } from '../../common/crypto';
+import { ENV, type Env } from '../../config/env';
 import { AppError } from '../../common/errors/app-error';
 import { Idempotent } from '../../common/http/idempotency';
 import { IdParam, ZBody } from '../../common/http/zod';
@@ -25,6 +27,7 @@ export class PaymentsController {
     private readonly payments: PaymentsService,
     private readonly bookings: BookingsService,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
+    @Inject(ENV) private readonly env: Env,
   ) {}
 
   /** After Razorpay Checkout succeeds: confirms the booking and returns it (with the token). */
@@ -53,6 +56,32 @@ export class PaymentsController {
   @Idempotent()
   retry(@PatientId() userId: string, @IdParam() bookingId: string) {
     return this.payments.retry(userId, bookingId);
+  }
+
+  /**
+   * Razorpay "redirect" mode, used by the web version (iPhone users in Safari): no pop-up windows, which phones
+   * block. After the bank / UPI page Razorpay sends the person here, and we send them straight back to the web app,
+   * which asks the server "was I charged?" (payments/:id/check) — nothing in this request is trusted, and `to` must
+   * be one of OPflow's own web addresses (CORS_ORIGINS), so this can never send anyone to another site.
+   */
+  @Post('payments/return')
+  @Public()
+  paidReturn(@Query('b') b: string, @Query('to') to: string, @Body() body: Record<string, unknown> | undefined, @Res() res: Response) {
+    this.sendBack(res, b, to, typeof body?.razorpay_payment_id === 'string');
+  }
+
+  @Get('payments/return')
+  @Public()
+  paidReturnGet(@Query('b') b: string, @Query('to') to: string, @Query('razorpay_payment_id') paymentId: string | undefined, @Res() res: Response) {
+    this.sendBack(res, b, to, typeof paymentId === 'string');
+  }
+
+  private sendBack(res: Response, bookingId: string, to: string, paid: boolean) {
+    const ownSite = typeof to === 'string' && this.env.CORS_ORIGINS.includes(to.replace(/\/$/, ''));
+    if (!ownSite || typeof bookingId !== 'string' || !/^[0-9a-f-]{36}$/i.test(bookingId)) {
+      throw new AppError('BAD_RETURN', 'This payment link is not valid. Please open OPflow and check My bookings.', HttpStatus.BAD_REQUEST);
+    }
+    res.redirect(303, `${to.replace(/\/$/, '')}/#/pay-return?b=${bookingId}&ok=${paid ? 1 : 0}`);
   }
 
   /**
