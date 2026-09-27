@@ -29,14 +29,25 @@ interface Snapshot {
   distanceM: number;
 }
 
+/** Reasons for a doctor OPflow has not hand-picked: only true, public facts (feedback stays private; only "well rated"). */
+function autoReasons(degrees: string, years: number, languages: string[], distanceM: number, avg: number | null): string[] {
+  const out = [degrees];
+  if (years > 0) out.push(`${years} years of experience`);
+  if (avg != null && avg >= 4) out.push('Well rated by OPflow patients');
+  if (languages.length) out.push(`Speaks ${languages.slice(0, 3).join(', ')}`);
+  out.push(`${(Math.round(distanceM / 100) / 10).toString()} km from you`);
+  return out.slice(0, 4);
+}
+
 const asPatient = (userId: string) => ({ role: 'patient' as const, userId });
 const asAdmin = (who: AdminPrincipal) => ({ role: 'admin' as const, adminId: who.adminId });
 
 /**
  * "Find Your Right Doctor": a paid, one-time suggestion of up to 3 doctors of one type near the patient.
  *
- * - The doctors are OPflow picks set by the admin only (rank + reasons). Doctors can never pay for, ask for or see a
- *   pick; the order is admin rank, then private patient feedback, then distance.
+ * - OPflow picks set by the admin (rank + reasons) come first. The rest of the list is filled with verified doctors of
+ *   that type near the patient, best-matched by private patient feedback, years of experience, then distance, with
+ *   reasons made from their public details. Doctors can never pay for, ask for or see a pick.
  * - The patient never pays when there is nothing to suggest (checked before the order and again when paid; if the
  *   picks vanished in between, the money goes back automatically).
  * - The result is a snapshot kept with the purchase (one-time; never refreshed).
@@ -55,24 +66,29 @@ export class PicksService {
 
   // ── Choosing the doctors ─────────────────────────────────────────────────────────────────────────
 
-  /** OPflow's picks of one type near a point, best-matched first (at most 3). */
+  /** Doctors of one type near a point, best-matched first (at most 3): OPflow picks, then the best of the rest. */
   private async candidates(tx: Tx, typeId: string, near: Near): Promise<Candidate[]> {
     const maxM = (await this.rules.picksMaxKm()) * 1000;
-    const rows = await sql<Candidate>`
-      select p.doctor_id, p.rank, p.reasons, x.distance_m::float8 as distance_m,
+    const rows = await sql<Candidate & { degrees: string; years: number; languages: string[]; picked: boolean }>`
+      select d.id as doctor_id, coalesce(p.rank, 99) as rank, coalesce(p.reasons, '{}') as reasons,
+             coalesce(p.active, false) as picked, x.distance_m::float8 as distance_m,
+             d.degrees, d.years_experience as years, d.languages,
              (select avg(f.rating)::float8 from visit_feedback f where f.doctor_id = d.id) as avg_rating
-        from doctor_picks p
-        join doctors d on d.id = p.doctor_id
+        from doctors d
+        left join doctor_picks p on p.doctor_id = d.id and p.active
         cross join lateral (
           select min(earth_distance(ll_to_earth(h.lat, h.lng), ll_to_earth(${near.lat}::float8, ${near.lng}::float8))) as distance_m
             from doctor_hospitals dh join hospitals h on h.id = dh.hospital_id
            where dh.doctor_id = d.id and dh.status = 'active' and h.status = 'active'
         ) x
-       where p.active and d.type_id = ${typeId} and d.verification = 'verified' and d.status = 'active'
+       where d.type_id = ${typeId} and d.verification = 'verified' and d.status = 'active'
          and not d.bookings_paused and x.distance_m is not null and x.distance_m <= ${maxM}
-       order by p.rank asc, avg_rating desc nulls last, x.distance_m asc
+       order by rank asc, avg_rating desc nulls last, d.years_experience desc, x.distance_m asc
        limit ${MAX_PICKS}`.execute(tx);
-    return rows.rows;
+    return rows.rows.map(({ degrees, years, languages, picked, ...c }) => ({
+      ...c,
+      reasons: picked && c.reasons.length ? c.reasons : autoReasons(degrees, years, languages, c.distanceM, c.avgRating),
+    }));
   }
 
   private async requireOn(): Promise<void> {

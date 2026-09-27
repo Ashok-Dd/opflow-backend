@@ -934,17 +934,21 @@ run('OPflow end to end', () => {
 
     const info = (await api().get('/v1/picks/info').set(bearer(patient.token)).expect(200)).body;
     expect(info).toMatchObject({ enabled: true, price: { paise: 9900 }, max: 3 });
-    // 1. Nothing picked yet: the offer says 0 and buying is refused (nobody pays for an empty list).
-    const none = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
+    // 1. No doctor of this type near (far away in Delhi): the offer says 0 and buying is refused.
+    const far = '28.6139,77.2090';
+    const none = await api().get('/v1/picks/offer').query({ type, near: far }).set(bearer(patient.token)).expect(200);
     expect(none.body).toMatchObject({ enabled: true, available: 0, price: { paise: 9900 } });
     expect(none.body.criteria).toContain('cannot pay to be suggested');
-    expect((await buy(patient, { consent: true }).expect(409)).body.error.code).toBe('NO_PICKS');
+    expect((await buy(patient, { consent: true, near: far }).expect(409)).body.error.code).toBe('NO_PICKS');
+    // Near the doctor with no OPflow pick yet: still on offer, with reasons from the doctor's public details.
+    const auto = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
+    expect(auto.body.available).toBeGreaterThanOrEqual(1);
 
     // 2. Only the admin picks, with reasons; doctors have no way to see or ask for it.
     await api().put(`/v1/admin/doctors/${s.doctorId}/pick`).set(bearer(s.superToken)).send({ active: true, rank: 1, reasons: ['MD General Medicine', '12 years of practice'] }).expect(200);
     await api().get('/v1/admin/picks').set(bearer(s.doctorToken)).expect(401);
     const offer = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
-    expect(offer.body.available).toBe(1);
+    expect(offer.body.available).toBeGreaterThanOrEqual(1);
 
     // 3. The patient must agree first; then ₹99 → paid → the list (a snapshot, up to 3).
     await buy(patient, {}).expect(400);
@@ -953,12 +957,12 @@ run('OPflow end to end', () => {
     const paid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: order.payment.orderId }).expect(200)).body;
     const done = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200)).body;
     expect(done.status).toBe('paid');
-    expect(done.doctors).toHaveLength(1);
-    expect(done.doctors[0]).toMatchObject({ reasons: ['MD General Medicine', '12 years of practice'], doctor: { id: s.doctorId } });
+    expect(done.doctors.length).toBeGreaterThanOrEqual(1);
+    expect(done.doctors.find((x: { doctor: { id: string } }) => x.doctor.id === s.doctorId)).toMatchObject({ reasons: ['MD General Medicine', '12 years of practice'] });
     // Again, or from the webhook later: still one result, paid once.
     await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200);
     const mine = (await api().get('/v1/picks/mine').set(bearer(patient.token)).expect(200)).body;
-    expect(mine.items.find((x: { id: string }) => x.id === order.purchase.id)).toMatchObject({ status: 'paid', count: 1 });
+    expect(mine.items.find((x: { id: string }) => x.id === order.purchase.id)).toMatchObject({ status: 'paid', count: done.doctors.length });
     // Another patient can never open it.
     await api().get(`/v1/picks/${order.purchase.id}`).set(bearer(other.token)).expect(404);
 
@@ -968,18 +972,20 @@ run('OPflow end to end', () => {
     const checked = (await api().post(`/v1/picks/${lost.purchase.id}/check`).set(bearer(patient.token)).expect(200)).body;
     expect(checked.status).toBe('paid');
 
-    // 5. The pick is switched off between paying and the result: the money goes back automatically.
+    // 5. Every doctor of the type stops taking bookings between paying and the result: the money goes back automatically.
     const late = (await buy(patient, { consent: true }).expect(201)).body;
-    await api().put(`/v1/admin/doctors/${s.doctorId}/pick`).set(bearer(s.superToken)).send({ active: false, rank: 1, reasons: ['MD General Medicine'] }).expect(200);
+    const open = (await dbs.sys(sql<{ id: string }>`update doctors set bookings_paused = true, bookings_paused_at = now()
+                                                     where type_id = ${type} and not bookings_paused returning id`)).rows.map((r) => r.id);
     const latePaid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: late.payment.orderId }).expect(200)).body;
     const back = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(latePaid).expect(200)).body;
+    await dbs.sys(sql`update doctors set bookings_paused = false, bookings_paused_at = null where id = any(${open})`);
     expect(back.status).toBe('refunded');
     expect(back.doctors).toHaveLength(0);
 
     // 6. The admin sees the sales (phone masked) and can give money back by hand.
     const sales = (await api().get('/v1/admin/picks/purchases').set(bearer(s.superToken)).expect(200)).body;
     const sale = sales.items.find((x: { id: string }) => x.id === checked.id);
-    expect(sale).toMatchObject({ status: 'paid', count: 1 });
+    expect(sale).toMatchObject({ status: 'paid' });
     expect(sale.phone).not.toMatch(/\d{10}/);
     await api().post(`/v1/admin/picks/purchases/${checked.id}/refund`).set(bearer(s.superToken)).send({ reason: 'Patient asked on the phone' }).expect(200);
     expect((await api().get(`/v1/picks/${checked.id}`).set(bearer(patient.token)).expect(200)).body.status).toBe('refunded');
