@@ -66,22 +66,24 @@ export class PaymentsController {
    */
   @Post('payments/return')
   @Public()
-  paidReturn(@Query('b') b: string, @Query('to') to: string, @Body() body: Record<string, unknown> | undefined, @Res() res: Response) {
-    this.sendBack(res, b, to, typeof body?.razorpay_payment_id === 'string');
+  paidReturn(@Query('b') b: string, @Query('p') p: string, @Query('to') to: string, @Body() body: Record<string, unknown> | undefined, @Res() res: Response) {
+    this.sendBack(res, b ?? p, to, typeof body?.razorpay_payment_id === 'string', p ? 'pick-return' : 'pay-return');
   }
 
   @Get('payments/return')
   @Public()
-  paidReturnGet(@Query('b') b: string, @Query('to') to: string, @Query('razorpay_payment_id') paymentId: string | undefined, @Res() res: Response) {
-    this.sendBack(res, b, to, typeof paymentId === 'string');
+  paidReturnGet(@Query('b') b: string, @Query('p') p: string, @Query('to') to: string, @Query('razorpay_payment_id') paymentId: string | undefined, @Res() res: Response) {
+    this.sendBack(res, b ?? p, to, typeof paymentId === 'string', p ? 'pick-return' : 'pay-return');
   }
 
-  private sendBack(res: Response, bookingId: string, to: string, paid: boolean) {
+  /** `b` = a booking (/pay-return), `p` = a ₹99 doctor suggestion (/pick-return). */
+  private sendBack(res: Response, bookingId: string, to: string, paid: boolean, screen: 'pay-return' | 'pick-return') {
     const ownSite = typeof to === 'string' && this.env.CORS_ORIGINS.includes(to.replace(/\/$/, ''));
     if (!ownSite || typeof bookingId !== 'string' || !/^[0-9a-f-]{36}$/i.test(bookingId)) {
       throw new AppError('BAD_RETURN', 'This payment link is not valid. Please open OPflow and check My bookings.', HttpStatus.BAD_REQUEST);
     }
-    res.redirect(303, `${to.replace(/\/$/, '')}/#/pay-return?b=${bookingId}&ok=${paid ? 1 : 0}`);
+    const key = screen === 'pick-return' ? 'p' : 'b';
+    res.redirect(303, `${to.replace(/\/$/, '')}/#/${screen}?${key}=${bookingId}&ok=${paid ? 1 : 0}`);
   }
 
   /**

@@ -668,6 +668,47 @@ export interface WindowSlots {
   windowId: string;
 }
 
+export interface DoctorPicks {
+  active: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  createdBy: string | null;
+  doctorId: string;
+  rank: Generated<number>;
+  reasons: Generated<string[]>;
+  updatedAt: Generated<Timestamp>;
+  updatedBy: string | null;
+}
+
+export interface PickPurchases {
+  amountPaise: number;
+  consentAt: Timestamp;
+  createdAt: Generated<Timestamp>;
+  id: Generated<string>;
+  nearLat: number;
+  nearLng: number;
+  paidAt: Timestamp | null;
+  patientUserId: string;
+  place: string | null;
+  razorpayOrderId: string;
+  razorpayPaymentId: string | null;
+  refundId: string | null;
+  refundReason: string | null;
+  refundedAt: Timestamp | null;
+  result: Json | null;
+  status: Generated<string>;
+  typeId: string;
+  updatedAt: Generated<Timestamp>;
+}
+
+export interface VisitFeedback {
+  bookingId: string;
+  createdAt: Generated<Timestamp>;
+  doctorId: string;
+  note: string | null;
+  patientUserId: string;
+  rating: number;
+}
+
 export interface DB {
   adminSetupTokens: AdminSetupTokens;
   adminUsers: AdminUsers;
@@ -700,9 +741,12 @@ export interface DB {
   opdWindows: OpdWindows;
   outbox: Outbox;
   patientProfiles: PatientProfiles;
+  pickPurchases: PickPurchases;
   payments: Payments;
   payoutAccounts: PayoutAccounts;
   phoneOtps: PhoneOtps;
+  doctorPicks: DoctorPicks;
+  visitFeedback: VisitFeedback;
   problemTypeMap: ProblemTypeMap;
   queueEntries: QueueEntries;
   queueEvents: QueueEvents;

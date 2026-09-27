@@ -70,6 +70,15 @@ export class RulesService {
   emergencyEnabled = () => this.flag('emergency.enabled', true);
   emergencyConsultEnabled = () => this.flag('emergency_consult.enabled', true);
   turnAlertsEnabled = () => this.flag('push.turn_alerts', true);
+  /** "Find Your Right Doctor": paid doctor suggestions. */
+  picksEnabled = () => this.flag('picks.enabled', true);
+  picksPricePaise = () => this.num('picks.price_paise', 9900);
+  picksMaxKm = () => this.num('picks.max_km', 25);
+  picksCriteria = () =>
+    this.text(
+      'picks.criteria',
+      "We look at each doctor's qualifications, years of relevant experience, training, areas of practice and feedback from verified OPflow patients. Doctors cannot pay to be suggested. This is a recommendation, not a guarantee of treatment outcome.",
+    );
 
   /** Throws the right simple-English error when a kill switch is off. */
   async requireBookingsOn(): Promise<void> {

@@ -921,6 +921,97 @@ run('OPflow end to end', () => {
     expect(summaries.rows[0]!.n).toBe(tomorrow.rows[0]!.n > 0 ? 1 : 0);
   });
 
+  it('Find Your Right Doctor: no charge without picks; ₹99 pays for a one-time list of admin picks; auto money back', async () => {
+    const patient = s.patients[2]!;
+    const other = s.patients[3]!;
+    const type = (await dbs.sys(sql<{ typeId: string }>`select type_id from doctors where id = ${s.doctorId}`)).rows[0]!.typeId;
+    // Suggestions are by distance: the test hospital gets a place on the map (Brodipet, Guntur).
+    await dbs.sys(sql`update hospitals set lat = 16.2999, lng = 80.4498 where id = ${s.hospitalId} and lat is null`);
+    const spot = (await dbs.sys(sql<{ lat: number; lng: number }>`select lat, lng from hospitals where id = ${s.hospitalId}`)).rows[0]!;
+    const near = `${spot.lat},${spot.lng}`;
+    const buy = (who: { token: string }, body: Record<string, unknown>) =>
+      api().post('/v1/picks/purchase').set(bearer(who.token)).set('Idempotency-Key', randomUUID()).send({ type, near, ...body });
+
+    // 1. Nothing picked yet: the offer says 0 and buying is refused (nobody pays for an empty list).
+    const none = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
+    expect(none.body).toMatchObject({ enabled: true, available: 0, price: { paise: 9900 } });
+    expect(none.body.criteria).toContain('cannot pay to be suggested');
+    expect((await buy(patient, { consent: true }).expect(409)).body.error.code).toBe('NO_PICKS');
+
+    // 2. Only the admin picks, with reasons; doctors have no way to see or ask for it.
+    await api().put(`/v1/admin/doctors/${s.doctorId}/pick`).set(bearer(s.superToken)).send({ active: true, rank: 1, reasons: ['MD General Medicine', '12 years of practice'] }).expect(200);
+    await api().get('/v1/admin/picks').set(bearer(s.doctorToken)).expect(401);
+    const offer = await api().get('/v1/picks/offer').query({ type, near }).set(bearer(patient.token)).expect(200);
+    expect(offer.body.available).toBe(1);
+
+    // 3. The patient must agree first; then ₹99 → paid → the list (a snapshot, up to 3).
+    await buy(patient, {}).expect(400);
+    const order = (await buy(patient, { consent: true, place: 'Brodipet, Guntur' }).expect(201)).body;
+    expect(order.payment.amount.paise).toBe(9900);
+    const paid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: order.payment.orderId }).expect(200)).body;
+    const done = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200)).body;
+    expect(done.status).toBe('paid');
+    expect(done.doctors).toHaveLength(1);
+    expect(done.doctors[0]).toMatchObject({ reasons: ['MD General Medicine', '12 years of practice'], doctor: { id: s.doctorId } });
+    // Again, or from the webhook later: still one result, paid once.
+    await api().post('/v1/picks/verify').set(bearer(patient.token)).send(paid).expect(200);
+    const mine = (await api().get('/v1/picks/mine').set(bearer(patient.token)).expect(200)).body;
+    expect(mine.items.find((x: { id: string }) => x.id === order.purchase.id)).toMatchObject({ status: 'paid', count: 1 });
+    // Another patient can never open it.
+    await api().get(`/v1/picks/${order.purchase.id}`).set(bearer(other.token)).expect(404);
+
+    // 4. Paid but the phone never came back: "check" finds the payment and makes the list.
+    const lost = (await buy(patient, { consent: true }).expect(201)).body;
+    await api().post('/v1/dev/razorpay/pay').send({ orderId: lost.payment.orderId }).expect(200);
+    const checked = (await api().post(`/v1/picks/${lost.purchase.id}/check`).set(bearer(patient.token)).expect(200)).body;
+    expect(checked.status).toBe('paid');
+
+    // 5. The pick is switched off between paying and the result: the money goes back automatically.
+    const late = (await buy(patient, { consent: true }).expect(201)).body;
+    await api().put(`/v1/admin/doctors/${s.doctorId}/pick`).set(bearer(s.superToken)).send({ active: false, rank: 1, reasons: ['MD General Medicine'] }).expect(200);
+    const latePaid = (await api().post('/v1/dev/razorpay/pay').send({ orderId: late.payment.orderId }).expect(200)).body;
+    const back = (await api().post('/v1/picks/verify').set(bearer(patient.token)).send(latePaid).expect(200)).body;
+    expect(back.status).toBe('refunded');
+    expect(back.doctors).toHaveLength(0);
+
+    // 6. The admin sees the sales (phone masked) and can give money back by hand.
+    const sales = (await api().get('/v1/admin/picks/purchases').set(bearer(s.superToken)).expect(200)).body;
+    const sale = sales.items.find((x: { id: string }) => x.id === checked.id);
+    expect(sale).toMatchObject({ status: 'paid', count: 1 });
+    expect(sale.phone).not.toMatch(/\d{10}/);
+    await api().post(`/v1/admin/picks/purchases/${checked.id}/refund`).set(bearer(s.superToken)).send({ reason: 'Patient asked on the phone' }).expect(200);
+    expect((await api().get(`/v1/picks/${checked.id}`).set(bearer(patient.token)).expect(200)).body.status).toBe('refunded');
+    await api().put(`/v1/admin/doctors/${s.doctorId}/pick`).set(bearer(s.superToken)).send({ active: true, rank: 1, reasons: ['MD General Medicine'] }).expect(200);
+  });
+
+  it('visit feedback is private: once, only after a finished visit, seen by the admin and never by doctors', async () => {
+    const ids = s.patients.map((x) => x.id);
+    const row = (
+      await dbs.sys(sql<{ id: string; patientUserId: string }>`select id, patient_user_id from bookings
+                                                               where status = 'completed' and patient_user_id = any(${ids}) limit 1`)
+    ).rows[0]!;
+    const who = s.patients.find((x) => x.id === row.patientUserId)!;
+    const other = s.patients.find((x) => x.id !== row.patientUserId)!;
+    await api().post(`/v1/bookings/${row.id}/feedback`).set(bearer(other.token)).send({ rating: 5 }).expect(404);
+    await api().post(`/v1/bookings/${row.id}/feedback`).set(bearer(who.token)).send({ rating: 6 }).expect(400);
+    await api().post(`/v1/bookings/${row.id}/feedback`).set(bearer(who.token)).send({ rating: 4, note: 'Listened well, short wait.' }).expect(200);
+    const again = await api().post(`/v1/bookings/${row.id}/feedback`).set(bearer(who.token)).send({ rating: 1 }).expect(409);
+    expect(again.body.error.code).toBe('ALREADY_SENT');
+    const upcoming = (await dbs.sys(sql<{ id: string; patientUserId: string }>`select id, patient_user_id from bookings where status = 'confirmed' limit 1`)).rows[0];
+    if (upcoming) {
+      const owner = s.patients.find((x) => x.id === upcoming.patientUserId);
+      if (owner) expect((await api().post(`/v1/bookings/${upcoming.id}/feedback`).set(bearer(owner.token)).send({ rating: 5 }).expect(409)).body.error.code).toBe('NOT_VISITED_YET');
+    }
+    const docId = (await dbs.sys(sql<{ doctorId: string }>`select doctor_id from bookings where id = ${row.id}`)).rows[0]!.doctorId;
+    const admin = (await api().get(`/v1/admin/doctors/${docId}/pick`).set(bearer(s.superToken)).expect(200)).body;
+    expect(admin.feedback).toMatchObject({ count: expect.any(Number) });
+    expect(admin.feedback.recent.some((f: { note: string }) => f.note === 'Listened well, short wait.')).toBe(true);
+    // Doctors: no route, and the database refuses them too.
+    await api().get(`/v1/admin/doctors/${docId}/pick`).set(bearer(s.doctorToken)).expect(401);
+    const seen = await dbs.as({ role: 'doctor', userId: randomUUID(), doctorId: docId } as never, (tx) => tx.selectFrom('visitFeedback').selectAll().execute());
+    expect(seen).toHaveLength(0);
+  });
+
   it('suspending a doctor hides them at once, refunds future bookings and ends their logins', async () => {
     const superFresh = await stepUp(s.superToken, s.superId, s.superSecret);
     const r = await api().post(`/v1/admin/doctors/${s.doctorId}/suspend`).set(bearer(superFresh)).send({ reason: 'Registration expired' }).expect(200);

@@ -12,6 +12,7 @@ import { DbService, Tx } from '../../infra/db/db.service';
 import { GatewayPayment, PAYMENT_GATEWAY, PaymentGateway } from '../../infra/payments/gateway';
 import { RulesService } from '../../infra/rules/rules.service';
 import { bumpSession, lockSession, orderKeyFor, tokenLabel } from '../live/session-events';
+import { PicksService } from '../picks/picks.service';
 
 export type ConfirmOutcome = 'confirmed' | 'already' | 'refunded_duplicate' | 'refunded_late';
 
@@ -35,6 +36,7 @@ interface BookingForConfirm {
  * Amounts always come from the database, never from the phone; the database also refuses a payment that
  * isn't exactly fee + emergency charge, or a doctor transfer that isn't exactly 90% of the fee.
  */
+
 @Injectable()
 export class PaymentsService {
   private readonly log = new Logger(PaymentsService.name);
@@ -45,6 +47,7 @@ export class PaymentsService {
     private readonly bus: LiveBus,
     @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway,
     @Inject(ENV) private readonly env: Env,
+    private readonly picks: PicksService,
   ) {}
 
   /** After Checkout: check the signature and the payment itself with Razorpay, then confirm. */
@@ -627,13 +630,14 @@ export class PaymentsService {
     const transfer = payload.transfer?.entity;
     if ((type === 'payment.captured' || type === 'order.paid') && payment) {
       const orderId = String(payment.order_id ?? '');
+      const gp = { id: String(payment.id), orderId, amount: Number(payment.amount), status: 'captured' as const, method: payment.method ? String(payment.method) : null, error: null };
       const row = await this.dbs.system((tx) => tx.selectFrom('payments').select(['id']).where('razorpayOrderId', '=', orderId).executeTakeFirst());
-      if (!row) return;
-      await this.confirm(
-        row.id,
-        { id: String(payment.id), orderId, amount: Number(payment.amount), status: 'captured', method: payment.method ? String(payment.method) : null, error: null },
-        'webhook',
-      );
+      // Not a booking: maybe a ₹99 doctor suggestion ("Find Your Right Doctor").
+      if (!row) {
+        await this.picks.webhookPaid(orderId, gp);
+        return;
+      }
+      await this.confirm(row.id, gp, 'webhook');
     } else if (type === 'payment.failed' && payment) {
       await this.dbs.system((tx) =>
         tx
