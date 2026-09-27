@@ -20,7 +20,11 @@ const profileBody = z
     birthYear: z.number().int().min(1900).max(2100).optional(),
     gender: z.enum(['female', 'male', 'other']),
     place: z.string().trim().max(60).optional(),
+    // The point of the patient's area (from the phone's location); both or neither.
+    placeLat: z.number().min(-90).max(90).nullable().optional(),
+    placeLng: z.number().min(-180).max(180).nullable().optional(),
   })
+  .refine((v) => (v.placeLat == null) === (v.placeLng == null), { message: 'Please send both parts of the location', path: ['placeLat'] })
   .refine((v) => v.age !== undefined || v.birthYear !== undefined, { message: 'Please give your age', path: ['age'] });
 const prefsBody = z.object({
   reminders: z.boolean().optional(),
@@ -52,7 +56,7 @@ export class MeController {
   async me(@PatientId() userId: string) {
     return this.dbs.as({ role: 'patient', userId }, async (tx) => {
       const user = await tx.selectFrom('users').select(['id', 'phone', 'email', 'createdAt']).where('id', '=', userId).executeTakeFirstOrThrow();
-      const profile = await tx.selectFrom('patientProfiles').select(['name', 'birthYear', 'gender', 'place']).where('userId', '=', userId).executeTakeFirst();
+      const profile = await tx.selectFrom('patientProfiles').select(['name', 'birthYear', 'gender', 'place', 'placeLat', 'placeLng']).where('userId', '=', userId).executeTakeFirst();
       return {
         ...user,
         needsProfile: !profile,
@@ -69,8 +73,17 @@ export class MeController {
     await this.dbs.as({ role: 'patient', userId }, (tx) =>
       tx
         .insertInto('patientProfiles')
-        .values({ userId, name: body.name, birthYear, gender: body.gender, place: body.place ?? null })
-        .onConflict((oc) => oc.column('userId').doUpdateSet({ name: body.name, birthYear, gender: body.gender, place: body.place ?? null }))
+        .values({ userId, name: body.name, birthYear, gender: body.gender, place: body.place ?? null, placeLat: body.placeLat ?? null, placeLng: body.placeLng ?? null })
+        .onConflict((oc) =>
+          oc.column('userId').doUpdateSet({
+            name: body.name,
+            birthYear,
+            gender: body.gender,
+            place: body.place ?? null,
+            // An update without a point keeps the saved one (older apps send only the area's name).
+            ...(body.placeLat !== undefined ? { placeLat: body.placeLat, placeLng: body.placeLng ?? null } : {}),
+          }),
+        )
         .execute(),
     );
     return this.me(userId);

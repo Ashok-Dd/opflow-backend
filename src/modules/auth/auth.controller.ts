@@ -12,6 +12,8 @@ export const zDevice = z
   .object({
     platform: z.enum(['android', 'ios', 'web']),
     fcmToken: z.string().min(10).max(4096).optional(),
+    // A random id kept by the app / browser for as long as it is installed: "the same device" for sign-in places.
+    installId: z.string().regex(/^[A-Za-z0-9-]{16,64}$/).optional(),
     appVersion: z.string().max(20).optional(),
     locale: z.string().max(10).optional(),
   })

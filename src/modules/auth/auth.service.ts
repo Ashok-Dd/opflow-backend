@@ -18,6 +18,7 @@ import { TokenPair, TokensService } from './tokens.service';
 export interface DeviceInput {
   platform: 'android' | 'ios' | 'web';
   fcmToken?: string;
+  installId?: string;
   appVersion?: string;
   locale?: string;
 }
@@ -147,7 +148,7 @@ export class AuthService {
       await tx.updateTable('users').set({ lastLoginAt: new Date() }).where('id', '=', user.id).execute();
       const deviceId = device ? await this.saveDevice(tx, user.id, device) : null;
       const pair = await this.tokens.issueApp(tx, { userId: user.id, role: 'patient' }, { ...meta, deviceId });
-      const profile = await tx.selectFrom('patientProfiles').select(['name', 'birthYear', 'gender', 'place']).where('userId', '=', user.id).executeTakeFirst();
+      const profile = await tx.selectFrom('patientProfiles').select(['name', 'birthYear', 'gender', 'place', 'placeLat', 'placeLng']).where('userId', '=', user.id).executeTakeFirst();
       return {
         ...pair,
         user: { id: user.id, phone, role: 'patient' as const, needsProfile: !profile, profile: profile ?? null },
@@ -239,12 +240,25 @@ export class AuthService {
 
   /** Remembers the phone for pushes. One FCM token belongs to one account at a time. */
   async saveDevice(tx: Tx, userId: string, d: DeviceInput): Promise<string> {
+    // The same install (app or browser) is the same device, even when its push token changed or is missing.
+    if (d.installId) {
+      const same = await tx.selectFrom('devices').select('id').where('installId', '=', d.installId).orderBy('lastSeenAt', 'desc').executeTakeFirst();
+      if (same) {
+        if (d.fcmToken) await tx.updateTable('devices').set({ fcmToken: null }).where('fcmToken', '=', d.fcmToken).where('id', '<>', same.id).execute();
+        await tx
+          .updateTable('devices')
+          .set({ userId, platform: d.platform, fcmToken: d.fcmToken ?? undefined, appVersion: d.appVersion ?? null, locale: d.locale ?? null, lastSeenAt: new Date() })
+          .where('id', '=', same.id)
+          .execute();
+        return same.id;
+      }
+    }
     if (d.fcmToken) {
       const existing = await tx.selectFrom('devices').select(['id', 'userId']).where('fcmToken', '=', d.fcmToken).executeTakeFirst();
       if (existing) {
         await tx
           .updateTable('devices')
-          .set({ userId, platform: d.platform, appVersion: d.appVersion ?? null, locale: d.locale ?? null, lastSeenAt: new Date() })
+          .set({ userId, platform: d.platform, appVersion: d.appVersion ?? null, locale: d.locale ?? null, lastSeenAt: new Date(), ...(d.installId ? { installId: d.installId } : {}) })
           .where('id', '=', existing.id)
           .execute();
         return existing.id;
@@ -253,7 +267,7 @@ export class AuthService {
     try {
       const row = await tx
         .insertInto('devices')
-        .values({ userId, platform: d.platform, fcmToken: d.fcmToken ?? null, appVersion: d.appVersion ?? null, locale: d.locale ?? null })
+        .values({ userId, platform: d.platform, fcmToken: d.fcmToken ?? null, installId: d.installId ?? null, appVersion: d.appVersion ?? null, locale: d.locale ?? null })
         .returning('id')
         .executeTakeFirstOrThrow();
       return row.id;

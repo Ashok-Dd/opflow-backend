@@ -372,17 +372,21 @@ export class LiveService {
     const people = await tx
       .selectFrom('queueEntries as q')
       .innerJoin('bookings as b', 'b.id', 'q.bookingId')
-      .select(['b.id', 'b.patientUserId'])
+      .innerJoin('doctors as d', 'd.id', 'b.doctorId')
+      .leftJoin('opdWindows as w', 'w.id', 'b.windowId')
+      .select(['b.id', 'b.patientUserId', 'd.name as doctorName', 'w.startsAt'])
       .where('q.sessionId', '=', s.id)
       .where('q.state', 'in', ['not_come', 'waiting'])
       .execute();
     for (const p of people) {
       if (!p.patientUserId) continue;
+      // "Your new time is about 9:15 AM": the booked hour moved by the delay (the line order does not change).
+      const newTime = p.startsAt ? istClock(new Date(new Date(p.startsAt).getTime() + minutes * 60_000)) : null;
       await notify(tx, {
         userId: p.patientUserId,
         kind: 'late',
-        title: 'Doctor is running late',
-        body: `The doctor is about ${minutes} minutes late today. Your place in line is safe.`,
+        title: `${p.doctorName} is ${minutes} min late`,
+        body: `${p.doctorName} is running about ${minutes} minutes late today.${newTime ? ` Please come by about ${newTime}.` : ''} Your place in line is safe.`,
         bookingId: p.id,
         dedupeKey: `late:${s.id}:${bucket}`,
       });

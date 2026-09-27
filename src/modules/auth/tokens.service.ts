@@ -4,7 +4,7 @@ import { sql } from 'kysely';
 import { AdminRoleName, AppRole, JwtService } from '../../common/auth/jwt.service';
 import { randomToken, sha256 } from '../../common/crypto';
 import { AppError } from '../../common/errors/app-error';
-import { notify, uuidv7 } from '../../common/outbox';
+import { uuidv7 } from '../../common/outbox';
 import { ENV, Env } from '../../config/env';
 import { DbService, Tx } from '../../infra/db/db.service';
 import { RulesService } from '../../infra/rules/rules.service';
@@ -186,7 +186,9 @@ export class TokensService {
    */
   /**
    * Phones and the doctor website have separate places: at most N phones (doctor.max_devices, default 2) and
-   * M website sign-ins (doctor.max_web_devices, default 1). A website sign-in never signs out a phone.
+   * M website sign-ins (doctor.max_web_devices, default 1). The same device signing in again replaces only its own
+   * session. A NEW device when the places are full is refused (DEVICE_LIMIT) — nobody is signed out by surprise;
+   * the doctor logs out on one device (Messages settings → Signed-in devices), or the admin signs them out everywhere.
    */
   private async makeRoomForDoctorDevice(tx: Tx, userId: string, deviceId: string | null): Promise<void> {
     // Two sign-ins at the same moment must not both see "one place free".
@@ -194,26 +196,31 @@ export class TokensService {
     const device = deviceId ? await tx.selectFrom('devices').select('platform').where('id', '=', deviceId).executeTakeFirst() : undefined;
     const web = device?.platform === 'web';
     const max = Math.max(1, web ? await this.rules.doctorMaxWebDevices() : await this.rules.doctorMaxDevices());
-    const live = (await this.liveSessions(tx, userId, 'doctor')).filter((x) => (x.platform === 'web') === web);
-    const extra = live.length - (max - 1);
-    for (const old of live.slice(0, Math.max(0, extra))) {
-      await this.revokeFamily(tx, old.familyId);
-      await notify(tx, {
-        userId,
-        kind: 'system',
-        title: 'Signed out on another device',
-        body: web
-          ? `OPflow for Doctors can be open in ${max === 1 ? 'one browser' : `${max} browsers`} at a time. You signed in on another computer, so the older one was signed out.`
-          : `Your OPflow account can be used on ${max} devices at a time. You signed in on a new device, so ${old.deviceLabel} was signed out.`,
-        dedupeKey: `device-out:${old.familyId}`,
-      });
+    const all = (await this.liveSessions(tx, userId, 'doctor')).filter((x) => (x.platform === 'web') === web);
+    // A session not used for 7 days (a lost or wiped phone, a forgotten browser) gives its place back.
+    const idleBefore = Date.now() - 7 * 86_400_000;
+    for (const idle of all.filter((x) => new Date(x.lastUsedAt).getTime() < idleBefore)) await this.revokeFamily(tx, idle.familyId);
+    const live = all.filter((x) => new Date(x.lastUsedAt).getTime() >= idleBefore);
+    // This same device signing in again: its old session goes, it keeps its place.
+    const mine = deviceId ? live.filter((x) => x.deviceId === deviceId) : [];
+    for (const old of mine) await this.revokeFamily(tx, old.familyId);
+    const others = live.length - mine.length;
+    if (others >= max) {
+      throw new AppError(
+        'DEVICE_LIMIT',
+        web
+          ? 'OPflow for Doctors is already open in another browser. Please log out there first, or log that browser out from the OPflow app (Messages settings → Signed-in devices).'
+          : `This account is already logged in on ${max} devices. Please log out on one of them (Messages settings → Signed-in devices), or call the OPflow team to log you out everywhere.`,
+        HttpStatus.CONFLICT,
+      );
     }
   }
 
   /** Live sessions of one person, least recently used first. */
   async liveSessions(tx: Tx, userId: string, role: AppRole) {
-    const r = await sql<{ familyId: string; startedAt: Date; lastUsedAt: Date; platform: string | null; appVersion: string | null; ip: string | null; userAgent: string | null }>`
+    const r = await sql<{ familyId: string; deviceId: string | null; startedAt: Date; lastUsedAt: Date; platform: string | null; appVersion: string | null; ip: string | null; userAgent: string | null }>`
       select rt.family_id,
+             (array_agg(rt.device_id::text order by rt.created_at desc))[1] as device_id,
              min(rt.created_at) as started_at,
              max(rt.created_at) as last_used_at,
              (array_agg(d.platform::text order by rt.created_at desc))[1] as platform,

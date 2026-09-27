@@ -236,6 +236,7 @@ export interface Devices {
   createdAt: Generated<Timestamp>;
   fcmToken: string | null;
   id: Generated<string>;
+  installId: string | null;
   lastSeenAt: Generated<Timestamp>;
   locale: string | null;
   platform: DevicePlatform;
@@ -489,6 +490,8 @@ export interface PatientProfiles {
   gender: Gender;
   name: string;
   place: string | null;
+  placeLat: number | null;
+  placeLng: number | null;
   updatedAt: Generated<Timestamp>;
   userId: string;
 }

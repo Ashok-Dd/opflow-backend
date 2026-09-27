@@ -237,47 +237,62 @@ run('OPflow end to end', () => {
     expect(locked.body.about).toBe('Fever, BP and sugar.');
   });
 
-  it('a doctor account works on at most 2 devices: a third sign-in signs out the least recently used one', async () => {
+  it('a doctor account works on at most 2 phones: a new third phone is refused, nobody is signed out', async () => {
     const phone1 = { token: s.doctorToken, refresh: s.doctorRefresh };
-    const login = (n: number) =>
-      api().post('/v1/auth/doctor/login').send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'android', fcmToken: `doctor-device-${n}-${randomUUID()}` } }).expect(200);
-    const phone2 = (await login(2)).body;
-    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(200); // 2 devices: both work
-    const phone3 = (await login(3)).body;
-    const out = await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(401);
-    expect(out.body.error.code).toBe('SIGNED_OUT'); // at once, not after 15 minutes
-    await api().post('/v1/auth/refresh').send({ refreshToken: phone1.refresh }).expect(401);
-    const list = await api().get('/v1/doctor/devices').set(bearer(phone3.accessToken)).expect(200);
+    const login = (installId: string) =>
+      api().post('/v1/auth/doctor/login').send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'android', installId } });
+    const id2 = `install-two-${randomUUID()}`;
+    const phone2 = (await login(id2).expect(200)).body;
+    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(200); // 2 phones: both work
+    // A new, third phone: refused with a clear message; both phones keep working.
+    const third = await login(`install-three-${randomUUID()}`).expect(409);
+    expect(third.body.error.code).toBe('DEVICE_LIMIT');
+    expect(third.body.error.message).toContain('already logged in on 2 devices');
+    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(phone2.accessToken)).expect(200);
+    // Phone 2 signs in again (same install): allowed, and it replaces only its own old session.
+    const phone2b = (await login(id2).expect(200)).body;
+    await api().get('/v1/doctor/me').set(bearer(phone2.accessToken)).expect(401);
+    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(200);
+    const list = await api().get('/v1/doctor/devices').set(bearer(phone1.token)).expect(200);
     expect(list.body.max).toBe(2);
     expect(list.body.items).toHaveLength(2);
-    expect(list.body.items.find((d: { thisDevice: boolean }) => d.thisDevice)).toBeDefined();
-    await jobs.relay(); // messages are delivered by the worker (outbox)
-    const msgs = await api().get('/v1/notifications').set(bearer(phone3.accessToken)).expect(200);
-    expect(msgs.body.items.some((m: { title: string }) => m.title === 'Signed out on another device')).toBe(true);
-    // The doctor signs out phone 2 from phone 3; the admin sees one device left.
+    // The doctor logs phone 2 out from phone 1: now the new phone can sign in.
     const other = list.body.items.find((d: { thisDevice: boolean }) => !d.thisDevice);
-    await api().post(`/v1/doctor/devices/${other.id}/sign-out`).set(bearer(phone3.accessToken)).expect(200);
-    await api().get('/v1/doctor/me').set(bearer(phone2.accessToken)).expect(401);
+    await api().post(`/v1/doctor/devices/${other.id}/sign-out`).set(bearer(phone1.token)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(phone2b.accessToken)).expect(401);
+    const phone3 = (await login(`install-three-${randomUUID()}`).expect(200)).body;
+    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(200);
+    // A phone not used for 7 days gives its place back (a lost or wiped phone never blocks the doctor).
+    const mine = (await api().get('/v1/doctor/devices').set(bearer(phone1.token)).expect(200)).body.items.find((d: { thisDevice: boolean }) => d.thisDevice);
+    await dbs.sys(sql`update refresh_tokens set created_at = created_at - interval '8 days' where family_id = ${mine.id}`);
+    const phone4 = (await login(`install-four-${randomUUID()}`).expect(200)).body;
+    await api().get('/v1/doctor/me').set(bearer(phone1.token)).expect(401);
+    await api().get('/v1/doctor/me').set(bearer(phone3.accessToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(phone4.accessToken)).expect(200);
     const adminView = await api().get(`/v1/admin/doctors/${s.doctorId}`).set(bearer(s.superToken)).expect(200);
-    expect(adminView.body.devices).toHaveLength(1);
+    expect(adminView.body.devices).toHaveLength(2);
+    // Leave one phone for the next tests.
+    const now = (await api().get('/v1/doctor/devices').set(bearer(phone3.accessToken)).expect(200)).body.items.find((d: { thisDevice: boolean }) => !d.thisDevice);
+    await api().post(`/v1/doctor/devices/${now.id}/sign-out`).set(bearer(phone3.accessToken)).expect(200);
     s.doctorToken = phone3.accessToken;
     s.doctorRefresh = phone3.refreshToken;
   });
 
-  it('the doctor website has its own place: it never signs out a phone; a second browser replaces the first', async () => {
+  it('the doctor website has its own place: it never signs out a phone; a second browser is refused', async () => {
     const key = 'k'.repeat(40);
     process.env.DOCTOR_WEB_KEY = key;
-    const phone = (await api().post('/v1/auth/doctor/login').send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'android', fcmToken: `doctor-device-w-${randomUUID()}` } }).expect(200)).body;
+    const phone = (await api().post('/v1/auth/doctor/login').send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'android', installId: `install-w-${randomUUID()}` } }).expect(200)).body;
     // Two phones now (phone3 from the test above + this one). The website signs in: both phones keep working.
-    const web = (ip: string, sentKey = key) =>
+    const web = (ip: string, installId: string, sentKey = key) =>
       api()
         .post('/v1/auth/doctor/login')
         .set('x-opflow-web-key', sentKey)
         .set('x-opflow-client-ip', ip)
         .set('x-opflow-client-ua', 'Mozilla/5.0 (Windows NT 10.0) Chrome/130')
-        .send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'web', appVersion: 'web' } })
-        .expect(200);
-    const web1 = (await web('203.0.113.7')).body;
+        .send({ loginId: s.loginId, password: 'Doctor-pass-2026', device: { platform: 'web', appVersion: 'web', installId } });
+    const browser1 = `browser-one-${randomUUID()}`;
+    const web1 = (await web('203.0.113.7', browser1).expect(200)).body;
     await api().get('/v1/doctor/me').set(bearer(s.doctorToken)).expect(200);
     await api().get('/v1/doctor/me').set(bearer(phone.accessToken)).expect(200);
     await api().get('/v1/doctor/me').set(bearer(web1.accessToken)).expect(200);
@@ -286,17 +301,23 @@ run('OPflow end to end', () => {
       (await dbs.sys(sql<{ ip: string; ua: string }>`select host(ip) as ip, user_agent as ua from refresh_tokens
                                                        where user_id = (select user_id from doctors where id = ${s.doctorId}) order by created_at desc limit 1`)).rows[0]!;
     expect(await newest()).toMatchObject({ ip: '203.0.113.7', ua: expect.stringContaining('Chrome') });
-    // A second computer: the first browser is signed out; the phones still are not.
-    const web2 = (await web('203.0.113.8')).body;
-    await api().get('/v1/doctor/me').set(bearer(web1.accessToken)).expect(401);
-    await api().get('/v1/doctor/me').set(bearer(web2.accessToken)).expect(200);
-    await api().get('/v1/doctor/me').set(bearer(s.doctorToken)).expect(200);
-    await api().get('/v1/doctor/me').set(bearer(phone.accessToken)).expect(200);
-    const list = await api().get('/v1/doctor/devices').set(bearer(web2.accessToken)).expect(200);
+    // A second computer: refused; the first browser and the phones keep working.
+    const second = await web('203.0.113.8', `browser-two-${randomUUID()}`).expect(409);
+    expect(second.body.error.code).toBe('DEVICE_LIMIT');
+    expect(second.body.error.message).toContain('already open in another browser');
+    await api().get('/v1/doctor/me').set(bearer(web1.accessToken)).expect(200);
+    // The same browser signing in again is fine.
+    const web1b = (await web('203.0.113.7', browser1).expect(200)).body;
+    await api().get('/v1/doctor/me').set(bearer(web1b.accessToken)).expect(200);
+    const list = await api().get('/v1/doctor/devices').set(bearer(phone.accessToken)).expect(200);
     expect(list.body.maxWeb).toBe(1);
-    expect(list.body.items.filter((d: { platform: string }) => d.platform === 'web')).toHaveLength(1);
+    const browser = list.body.items.find((d: { platform: string }) => d.platform === 'web');
+    expect(browser).toBeDefined();
+    // The phone logs the browser out; then another computer may sign in.
+    await api().post(`/v1/doctor/devices/${browser.id}/sign-out`).set(bearer(phone.accessToken)).expect(200);
+    await api().get('/v1/doctor/me').set(bearer(web1b.accessToken)).expect(401);
     // Without the right key, a forwarded address is ignored (nobody can fake their IP).
-    await web('198.51.100.9', 'x'.repeat(40));
+    await web('198.51.100.9', `browser-three-${randomUUID()}`, 'x'.repeat(40)).expect(200);
     expect((await newest()).ip).not.toBe('198.51.100.9');
     delete process.env.DOCTOR_WEB_KEY;
   });
@@ -319,7 +340,9 @@ run('OPflow end to end', () => {
     for (let i = 1; i <= 8; i++) s.patients.push(await newPatient(i));
     const windows = await bookableWindows();
     expect(windows.length).toBeGreaterThan(3);
-    s.windowId = windows[0]!.id;
+    // An hour from an OPD that has another free hour too (late in the evening, today's OPD may have just one left).
+    const first = windows.find((w) => windows.some((o) => o.sessionId === w.sessionId && o.id !== w.id)) ?? windows[0]!;
+    s.windowId = first.id;
     const p = s.patients[0]!;
     const key = randomUUID();
     const h = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', key).send({ windowId: s.windowId }).expect(201);
@@ -327,7 +350,7 @@ run('OPflow end to end', () => {
     expect(h.body.payment.amount.paise).toBe(50000);
     const replay = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', key).send({ windowId: s.windowId }).expect(201);
     expect(replay.body.booking.id).toBe(h.body.booking.id);
-    const mismatch = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', key).send({ windowId: windows[1]!.id });
+    const mismatch = await api().post('/v1/bookings/hold').set(bearer(p.token)).set('Idempotency-Key', key).send({ windowId: windows.find((w) => w.id !== first.id)!.id });
     expect(mismatch.body.error.code).toBe('IDEMPOTENCY_MISMATCH');
 
     const paid = await api().post('/v1/dev/razorpay/pay').send({ orderId: h.body.payment.orderId }).expect(200);
