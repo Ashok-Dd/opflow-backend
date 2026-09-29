@@ -294,12 +294,19 @@ export class PicksService {
 
   // ── Visit feedback (private) ─────────────────────────────────────────────────────────────────────
 
-  /** "How was your visit?" — once, only for the patient's own completed visit. Only OPflow reads it. */
+  /**
+   * "How was your visit?" — once, only for the patient's own visit that is over: the booking is completed, or the
+   * doctor already marked the patient Done while the OPD is still running. Only OPflow reads it.
+   */
   async feedback(userId: string, bookingId: string, rating: number, note?: string) {
+    const seen = await this.dbs.system((tx) =>
+      tx.selectFrom('queueEntries').select('state').where('bookingId', '=', bookingId).executeTakeFirst(),
+    );
     await this.dbs.as(asPatient(userId), async (tx) => {
       const b = await tx.selectFrom('bookings').select(['id', 'status', 'doctorId']).where('id', '=', bookingId).where('patientUserId', '=', userId).executeTakeFirst();
       if (!b) throw new AppError('BOOKING_NOT_FOUND', 'We could not find this booking.', HttpStatus.NOT_FOUND);
-      if (b.status !== 'completed') throw new AppError('NOT_VISITED_YET', 'You can tell us about the visit after it is done.', HttpStatus.CONFLICT);
+      const over = b.status === 'completed' || (b.status === 'confirmed' && seen?.state === 'done');
+      if (!over) throw new AppError('NOT_VISITED_YET', 'You can tell us about the visit after the doctor has seen you.', HttpStatus.CONFLICT);
       try {
         await tx
           .insertInto('visitFeedback')

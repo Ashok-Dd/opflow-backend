@@ -1087,7 +1087,13 @@ run('OPflow end to end', () => {
     const upcoming = (await dbs.sys(sql<{ id: string; patientUserId: string }>`select id, patient_user_id from bookings where status = 'confirmed' limit 1`)).rows[0];
     if (upcoming) {
       const owner = s.patients.find((x) => x.id === upcoming.patientUserId);
-      if (owner) expect((await api().post(`/v1/bookings/${upcoming.id}/feedback`).set(bearer(owner.token)).send({ rating: 5 }).expect(409)).body.error.code).toBe('NOT_VISITED_YET');
+      if (owner) {
+        expect((await api().post(`/v1/bookings/${upcoming.id}/feedback`).set(bearer(owner.token)).send({ rating: 5 }).expect(409)).body.error.code).toBe('NOT_VISITED_YET');
+        // The doctor marks the patient Done while the OPD is still running: feedback is welcome at once.
+        await dbs.sys(sql`update queue_entries set state = 'with_doctor' where booking_id = ${upcoming.id}`);
+        await dbs.sys(sql`update queue_entries set state = 'done' where booking_id = ${upcoming.id}`);
+        await api().post(`/v1/bookings/${upcoming.id}/feedback`).set(bearer(owner.token)).send({ rating: 5, note: 'Well done by the doctor' }).expect(200);
+      }
     }
     const docId = (await dbs.sys(sql<{ doctorId: string }>`select doctor_id from bookings where id = ${row.id}`)).rows[0]!.doctorId;
     const admin = (await api().get(`/v1/admin/doctors/${docId}/pick`).set(bearer(s.superToken)).expect(200)).body;
