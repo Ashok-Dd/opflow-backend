@@ -21,6 +21,9 @@ interface IssueContext {
   deviceId?: string | null;
 }
 
+/** A doctor session not used for this long is over everywhere: it can't refresh, it isn't listed, its place is free. */
+export const DOCTOR_IDLE_DAYS = 7;
+
 const relogin = () => new AppError('UNAUTHENTICATED', 'Please log in again.', HttpStatus.UNAUTHORIZED);
 
 /**
@@ -125,6 +128,11 @@ export class TokensService {
         return { error: relogin() };
       }
       if (new Date(row.expiresAt).getTime() <= Date.now()) return { error: relogin() };
+      // A doctor's session left unused (cookie expired, phone put away) ends for good, same as the device list shows.
+      if (row.role === 'doctor' && Date.now() - new Date(row.createdAt).getTime() > DOCTOR_IDLE_DAYS * 86_400_000) {
+        await this.revokeFamily(tx, row.familyId);
+        return { error: relogin() };
+      }
 
       let pair: TokenPair;
       if (row.adminId) {
@@ -196,11 +204,8 @@ export class TokensService {
     const device = deviceId ? await tx.selectFrom('devices').select('platform').where('id', '=', deviceId).executeTakeFirst() : undefined;
     const web = device?.platform === 'web';
     const max = Math.max(1, web ? await this.rules.doctorMaxWebDevices() : await this.rules.doctorMaxDevices());
-    const all = (await this.liveSessions(tx, userId, 'doctor')).filter((x) => (x.platform === 'web') === web);
-    // A session not used for 7 days (a lost or wiped phone, a forgotten browser) gives its place back.
-    const idleBefore = Date.now() - 7 * 86_400_000;
-    for (const idle of all.filter((x) => new Date(x.lastUsedAt).getTime() < idleBefore)) await this.revokeFamily(tx, idle.familyId);
-    const live = all.filter((x) => new Date(x.lastUsedAt).getTime() >= idleBefore);
+    // liveSessions ends sessions idle for DOCTOR_IDLE_DAYS first, so a forgotten browser or lost phone gives its place back.
+    const live = (await this.liveSessions(tx, userId, 'doctor')).filter((x) => (x.platform === 'web') === web);
     // This same device signing in again: its old session goes, it keeps its place.
     const mine = deviceId ? live.filter((x) => x.deviceId === deviceId) : [];
     for (const old of mine) await this.revokeFamily(tx, old.familyId);
@@ -216,8 +221,9 @@ export class TokensService {
     }
   }
 
-  /** Live sessions of one person, least recently used first. */
+  /** Live sessions of one person, least recently used first. Doctor sessions idle too long are ended here first. */
   async liveSessions(tx: Tx, userId: string, role: AppRole) {
+    if (role === 'doctor') await this.endIdleDoctorSessions(tx, userId);
     const r = await sql<{ familyId: string; deviceId: string | null; startedAt: Date; lastUsedAt: Date; platform: string | null; appVersion: string | null; ip: string | null; userAgent: string | null }>`
       select rt.family_id,
              (array_agg(rt.device_id::text order by rt.created_at desc))[1] as device_id,
@@ -237,6 +243,23 @@ export class TokensService {
       ...x,
       deviceLabel: x.platform === 'ios' ? 'an iPhone' : x.platform === 'android' ? 'an Android phone' : x.platform === 'web' ? 'a web browser' : 'another device',
     }));
+  }
+
+  /** Ends doctor sessions whose newest token is older than DOCTOR_IDLE_DAYS (it is renewed at every refresh = every use). */
+  private async endIdleDoctorSessions(tx: Tx, userId: string): Promise<void> {
+    const idle = await sql<{ familyId: string }>`
+      select family_id from refresh_tokens
+       where user_id = ${userId} and role = 'doctor'
+       group by family_id
+      having bool_or(revoked_at is null and expires_at > now())
+         and max(created_at) < now() - make_interval(days => ${DOCTOR_IDLE_DAYS})`.execute(tx);
+    for (const f of idle.rows) await this.revokeFamily(tx, f.familyId);
+  }
+
+  /** How many places are in use: phones and websites are counted separately. */
+  static countByKind(rows: { platform: string | null }[]) {
+    const web = rows.filter((x) => x.platform === 'web').length;
+    return { web, phones: rows.length - web };
   }
 
   /** Sign out everywhere (password change, suspension, account deletion). */

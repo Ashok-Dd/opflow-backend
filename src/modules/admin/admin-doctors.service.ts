@@ -113,6 +113,7 @@ export class AdminDoctorsService {
       photo: this.dir.photo(d.photoKey),
       documents,
       hospitals,
+      deviceCounts: TokensService.countByKind(devices),
       devices: devices.reverse().map((x) => ({ id: x.familyId, device: x.deviceLabel.replace(/^an? /, ''), appVersion: x.appVersion, signedInAt: x.startedAt, lastUsedAt: x.lastUsedAt, ip: x.ip })),
       payout: payout ?? null,
       checklist: {

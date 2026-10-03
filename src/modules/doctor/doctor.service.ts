@@ -538,6 +538,7 @@ export class DoctorService {
     return {
       max,
       maxWeb,
+      counts: TokensService.countByKind(rows),
       items: rows.reverse().map((r) => ({
         id: r.familyId,
         thisDevice: r.familyId === currentSid,
