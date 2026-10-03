@@ -146,6 +146,18 @@ export class DoctorService {
   }
 
   /** Bookings on any day (the Bookings tab). */
+  /** Patients' phone numbers for bookings the doctor can already see (the ids come from the doctor's own query). */
+  private async phonesFor(ids: string[]): Promise<Map<string, string | null>> {
+    if (ids.length === 0) return new Map();
+    const r = await this.dbs.system((tx) =>
+      sql<{ id: string; phone: string | null }>`
+        select b.id, coalesce(u.phone, b.walk_in_phone) as phone
+          from bookings b left join users u on u.id = b.patient_user_id
+         where b.id = any(${ids}::uuid[])`.execute(tx),
+    );
+    return new Map(r.rows.map((x) => [x.id, x.phone]));
+  }
+
   async bookingsOn(d: DoctorIdentity, date: string, hospitalId?: string, filter?: 'all' | 'upcoming' | 'cancelled') {
     return this.dbs.as(as(d), async (tx) => {
       const rows = await sql<{
@@ -165,11 +177,13 @@ export class DoctorService {
                 or (${filter ?? 'all'} = 'upcoming' and b.status = 'confirmed')
                 or (${filter ?? 'all'} = 'cancelled' and b.status = 'cancelled_by_provider'))
          order by coalesce(w.starts_at, s.starts_at), case when b.source = 'emergency' then 0 else 1 end, b.token`.execute(tx);
+      const phones = await this.phonesFor(rows.rows.map((b) => b.id));
       return {
         date,
         dayLabel: istDayLabel(date),
         items: rows.rows.map((b) => ({
           id: b.id,
+          phone: phones.get(b.id) ?? null,
           code: b.code,
           status: b.status,
           tokenLabel: tokenLabel(b.source, b.token),
@@ -237,6 +251,7 @@ export class DoctorService {
       const w = when.rows[0];
       return {
         ...b,
+        phone: (await this.phonesFor([b.id])).get(b.id) ?? null,
         bookingId: b.id,
         name: b.patientName,
         age: b.patientAge,
