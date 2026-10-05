@@ -192,6 +192,8 @@ export class JobsService implements OnApplicationShutdown {
         return this.live.turnCheck(String(p.sessionId));
       case 'photo.process':
         return this.processPhoto(String(p.doctorId), String(p.uploadKey));
+      case 'hospital.photo':
+        return this.processHospitalPhoto(String(p.hospitalId), String(p.uploadKey));
       case 'bulk.cancel':
         return this.doctors.runBulkCancel(String(p.bulkId), String(p.bookingId), String(p.reason), (p.actorId as string | null) ?? null);
       case 'reminder':
@@ -252,27 +254,39 @@ export class JobsService implements OnApplicationShutdown {
     });
   }
 
-  /** Doctor photo: 3 WebP sizes, EXIF (and so any location) removed. Rejects files that are not images or too big. */
+  /** Doctor photo: 3 WebP sizes (portrait 4:5), EXIF (and so any location) removed. Rejects files that are not images or too big. */
   private async processPhoto(doctorId: string, uploadKey: string): Promise<void> {
+    const base = await this.resizeUpload('doctors', doctorId, uploadKey, [['s', 96, 120], ['m', 320, 400], ['l', 800, 1000]]);
+    if (base) await this.dbs.system((tx) => tx.updateTable('doctors').set({ photoKey: base }).where('id', '=', doctorId).execute());
+  }
+
+  /** Hospital photo: 3 WebP sizes (landscape 16:9), EXIF removed. */
+  private async processHospitalPhoto(hospitalId: string, uploadKey: string): Promise<void> {
+    const base = await this.resizeUpload('hospitals', hospitalId, uploadKey, [['s', 320, 180], ['m', 800, 450], ['l', 1600, 900]]);
+    if (base) await this.dbs.system((tx) => tx.updateTable('hospitals').set({ photoKey: base }).where('id', '=', hospitalId).execute());
+  }
+
+  /** Reads the staged upload, writes the sizes to the public bucket and returns their key prefix (null when the file is unusable). */
+  private async resizeUpload(folder: 'doctors' | 'hospitals', id: string, uploadKey: string, sizes: readonly (readonly [string, number, number])[]): Promise<string | null> {
     const original = await this.storage.get('private', uploadKey);
     if (original.length > this.env.UPLOAD_MAX_BYTES) {
-      this.log.warn(`Photo for doctor ${doctorId} is too big (${original.length} bytes); ignored`);
-      return;
+      this.log.warn(`Photo for ${folder} ${id} is too big (${original.length} bytes); ignored`);
+      return null;
     }
     let meta;
     try {
       meta = await sharp(original).metadata();
     } catch {
-      this.log.warn(`Photo for doctor ${doctorId} is not an image; ignored`);
-      return;
+      this.log.warn(`Photo for ${folder} ${id} is not an image; ignored`);
+      return null;
     }
-    if (!meta.width || !meta.height || meta.width * meta.height > 50_000_000) return;
-    const base = `doctors/${doctorId}/${uuidv7()}`;
-    for (const [size, px] of [['s', 96], ['m', 320], ['l', 800]] as const) {
-      const out = await sharp(original).rotate().resize(px, Math.round(px * 1.25), { fit: 'cover', position: 'attention' }).webp({ quality: 82 }).toBuffer();
+    if (!meta.width || !meta.height || meta.width * meta.height > 50_000_000) return null;
+    const base = `${folder}/${id}/${uuidv7()}`;
+    for (const [size, w, h] of sizes) {
+      const out = await sharp(original).rotate().resize(w, h, { fit: 'cover', position: 'attention' }).webp({ quality: 82 }).toBuffer();
       await this.storage.put('public', `${base}-${size}.webp`, out, 'image/webp');
     }
-    await this.dbs.system((tx) => tx.updateTable('doctors').set({ photoKey: base }).where('id', '=', doctorId).execute());
+    return base;
   }
 
   // ── Timed jobs ────────────────────────────────────────────────────────────────────────────────────

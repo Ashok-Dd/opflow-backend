@@ -389,6 +389,7 @@ export interface Hospitals {
   name: string;
   opdTimingsText: string | null;
   phone: string;
+  photoKey: string | null;
   pin: string;
   search: Generated<string | null>;
   slug: string;

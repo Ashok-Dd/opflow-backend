@@ -1283,6 +1283,7 @@ CREATE TABLE public.hospitals (
     search tsvector GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, (((((((name)::text || ' '::text) || (area)::text) || ' '::text) || (city)::text) || ' '::text) || (pin)::text))) STORED,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    photo_key text,
     CONSTRAINT hospitals_lat_check CHECK (((lat >= ('-90'::integer)::double precision) AND (lat <= (90)::double precision))),
     CONSTRAINT hospitals_lng_check CHECK (((lng >= ('-180'::integer)::double precision) AND (lng <= (180)::double precision))),
     CONSTRAINT hospitals_pin_check CHECK (((pin)::text ~ '^[1-9][0-9]{5}$'::text)),

@@ -402,8 +402,15 @@ export class AdminOpsController {
 
   @Patch('hospitals/:id')
   @Admin('super', 'ops')
-  updateHospital(@CurrentAdmin() who: AdminPrincipal, @IdParam() id: string, @ZBody(hospitalBody.partial().extend({ status: z.enum(['active', 'hidden']).optional() })) b: Record<string, unknown>, @Meta() meta: RequestMeta) {
+  updateHospital(@CurrentAdmin() who: AdminPrincipal, @IdParam() id: string, @ZBody(hospitalBody.partial().extend({ status: z.enum(['active', 'hidden']).optional(), photoUploadKey: z.string().regex(/^uploads\/hospitals\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.(jpg|png|webp)$/).nullable().optional() })) b: Record<string, unknown>, @Meta() meta: RequestMeta) {
     return this.admin.updateHospital(who, id, b, meta);
+  }
+
+  @Post('hospitals/:id/photo/upload-url')
+  @Admin('super', 'ops')
+  @HttpCode(200)
+  hospitalPhotoUrl(@IdParam() id: string, @ZBody(z.object({ contentType: z.enum(['image/jpeg', 'image/png', 'image/webp']) })) b: { contentType: string }) {
+    return this.admin.hospitalPhotoUploadUrl(id, b.contentType);
   }
 
   @Post('hospitals/geocode')

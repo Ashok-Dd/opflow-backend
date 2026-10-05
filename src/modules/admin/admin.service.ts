@@ -6,11 +6,12 @@ import { audit } from '../../common/audit';
 import { AppError } from '../../common/errors/app-error';
 import { isUniqueViolation } from '../../common/errors/pg-errors';
 import { money } from '../../common/money';
-import { enqueue, notify } from '../../common/outbox';
+import { enqueue, notify, uuidv7 } from '../../common/outbox';
 import { addDays, istToday } from '../../common/time';
 import { ENV, Env } from '../../config/env';
 import { LiveBus } from '../../infra/bus/live-bus';
 import { DbService } from '../../infra/db/db.service';
+import { STORAGE, Storage } from '../../infra/storage/storage';
 import { maskContact } from '../../infra/messaging/messaging';
 import { RulesService } from '../../infra/rules/rules.service';
 import { TokensService } from '../auth/tokens.service';
@@ -41,6 +42,8 @@ export interface HospitalInput {
   hasEmergency?: boolean;
   departments?: string[];
   status?: 'active' | 'hidden';
+  /** A staged upload to turn into the hospital's landscape photo; null removes the photo. */
+  photoUploadKey?: string | null;
 }
 
 @Injectable()
@@ -56,6 +59,7 @@ export class AdminService {
     private readonly tokens: TokensService,
     private readonly bus: LiveBus,
     @Inject(ENV) private readonly env: Env,
+    @Inject(STORAGE) private readonly storage: Storage,
   ) {}
 
   // ── Dashboard ─────────────────────────────────────────────────────────────────────────────────────
@@ -162,8 +166,10 @@ export class AdminService {
     return this.dbs.as(as(who), async (tx) => {
       const before = await tx.selectFrom('hospitals').selectAll().where('id', '=', id).executeTakeFirst();
       if (!before) throw new AppError('HOSPITAL_NOT_FOUND', 'We could not find this hospital.', HttpStatus.NOT_FOUND);
-      const { departments, slug: _slug, ...rest } = h;
-      const set = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
+      const { departments, slug: _slug, photoUploadKey, ...rest } = h;
+      const set: Record<string, unknown> = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
+      if (photoUploadKey === null) set.photoKey = null; // photo removed
+      else if (photoUploadKey) await enqueue(tx, { topic: 'hospital.photo', payload: { hospitalId: id, uploadKey: photoUploadKey } });
       if (Object.keys(set).length) await tx.updateTable('hospitals').set(set).where('id', '=', id).execute();
       if (departments) {
         await tx.deleteFrom('hospitalDepartments').where('hospitalId', '=', id).execute();
@@ -172,6 +178,16 @@ export class AdminService {
       await audit(tx, { actorType: 'admin', actorId: who.adminId, action: 'hospital.update', entity: 'hospital', entityId: id, before, after: h, meta });
       return { ok: true };
     });
+  }
+
+  /** A 5-minute upload link for a hospital's photo (the file goes straight to storage; the worker makes the sizes). */
+  async hospitalPhotoUploadUrl(id: string, contentType: string) {
+    const exists = await this.dbs.db.selectFrom('hospitals').select('id').where('id', '=', id).executeTakeFirst();
+    if (!exists) throw new AppError('HOSPITAL_NOT_FOUND', 'We could not find this hospital.', HttpStatus.NOT_FOUND);
+    const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
+    const key = `uploads/hospitals/${id}/${uuidv7()}.${ext}`;
+    const put = await this.storage.presignPut('private', key, contentType, 300);
+    return { key, url: put.url, headers: put.headers, method: 'PUT', maxBytes: this.env.UPLOAD_MAX_BYTES, expiresInSeconds: 300 };
   }
 
   async hospital(id: string) {
@@ -186,7 +202,7 @@ export class AdminService {
       .where('s.hospitalId', '=', id)
       .where('s.date', '=', istToday())
       .execute();
-    return { ...h, departments: departments.map((d) => d.typeId), doctors: doctors.items, todaySessions: sessions };
+    return { ...h, photo: this.dir.photo(h.photoKey), departments: departments.map((d) => d.typeId), doctors: doctors.items, todaySessions: sessions };
   }
 
   /** Address → map pin (Google Geocoding), when a key is configured. */

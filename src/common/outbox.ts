@@ -14,6 +14,7 @@ export type OutboxMessage =
   | { topic: 'refund.start'; payload: { refundId: string } }
   | { topic: 'live.publish'; payload: { sessionId: string } }
   | { topic: 'photo.process'; payload: { doctorId: string; uploadKey: string } }
+  | { topic: 'hospital.photo'; payload: { hospitalId: string; uploadKey: string } }
   | { topic: 'bulk.cancel'; payload: { bulkId: string; bookingId: string; reason: string; actorId: string | null } }
   | { topic: 'reminder'; payload: { bookingId: string; windowId: string | null; which: 'day' | 'hour' } }
   | { topic: 'email'; payload: { to: string; subject: string; text: string } }

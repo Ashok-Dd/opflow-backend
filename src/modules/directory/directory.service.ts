@@ -350,11 +350,11 @@ export class DirectoryService {
     const q = f.q?.trim() ? f.q.trim() : null;
     const rows = await sql<{
       id: string; slug: string; name: string; address: string; area: string; city: string; pin: string; lat: number; lng: number;
-      phone: string; opdTimingsText: string | null; hasEmergency: boolean; facadeSeed: number; status: string;
+      phone: string; opdTimingsText: string | null; hasEmergency: boolean; facadeSeed: number; photoKey: string | null; status: string;
       departments: string[] | null; doctorCount: number; distanceM: number | null;
     }>`
       select h.id, h.slug, h.name, h.address, h.area, h.city, h.pin, h.lat, h.lng, h.phone, h.opd_timings_text, h.has_emergency,
-             h.facade_seed, h.status,
+             h.facade_seed, h.photo_key, h.status,
              (select array_agg(hd.type_id order by hd.type_id) from hospital_departments hd where hd.hospital_id = h.id) as departments,
              (select count(*)::int from doctor_hospitals dh join doctors d on d.id = dh.doctor_id
                where dh.hospital_id = h.id and dh.status = 'active' and d.verification = 'verified' and d.status = 'active') as doctor_count,
@@ -381,6 +381,7 @@ export class DirectoryService {
       opdTimings: h.opdTimingsText,
       hasEmergency: h.hasEmergency,
       facadeSeed: h.facadeSeed,
+      photo: this.photo(h.photoKey),
       departments: h.departments ?? [],
       doctorCount: h.doctorCount,
       distanceKm: h.distanceM === null ? null : Math.round(Number(h.distanceM) / 100) / 10,
@@ -408,6 +409,7 @@ export class DirectoryService {
       opdTimings: base.opdTimingsText,
       hasEmergency: base.hasEmergency,
       facadeSeed: base.facadeSeed,
+      photo: this.photo(base.photoKey),
       departments: departments.map((d) => d.typeId),
       doctors: doctors.items,
     };
