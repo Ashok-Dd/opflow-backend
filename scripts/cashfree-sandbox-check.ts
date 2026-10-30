@@ -22,7 +22,7 @@ async function main() {
     orderId: cashfreeId('op', randomUUID()),
     amountPaise: 100,
     customer: { id: 'u_sandbox_check', phone: '9999999999' },
-    returnUrl: 'https://opflow-backend.onrender.com/v1/payments/return?b=00000000-0000-0000-0000-000000000000&to=https%3A%2F%2Fopflow-alpha.vercel.app&order_id={order_id}',
+    returnUrl: 'https://backend.opflow.in/v1/payments/return?b=00000000-0000-0000-0000-000000000000&to=https%3A%2F%2Fopflow-alpha.vercel.app&order_id={order_id}',
     note: 'OPflow sandbox check',
     expiresAt: new Date(Date.now() + 20 * 60_000),
   });

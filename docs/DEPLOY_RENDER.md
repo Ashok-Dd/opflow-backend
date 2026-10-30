@@ -44,7 +44,7 @@ shows the code on its code screen (test server only).
 
 The database certificate (`DB_SSL_CA_B64`) is already in `render.yaml`.
 
-When the deploy finishes, open `https://opflow-api.onrender.com/ready`. It must show `"database": {"ok": true}`.
+When the deploy finishes, open `https://backend.opflow.in/ready`. It must show `"database": {"ok": true}`.
 Every push to `main` deploys again automatically (changes to `docs/` or `migrations/` alone do not).
 
 ## 3. Doctors and the admin
@@ -61,7 +61,7 @@ Both use `backend/.env`, which points at Supabase.
 
 ```bash
 cd app
-flutter build apk --release --dart-define=BACKEND=api --dart-define=API_BASE_URL=https://opflow-api.onrender.com
+flutter build apk --release --dart-define=BACKEND=api --dart-define=API_BASE_URL=https://backend.opflow.in
 ```
 
 Patients log in with any mobile number and the `DEMO_OTP_CODE`. The demo doctor (after step 3's demo data) is
@@ -74,8 +74,8 @@ Demo mode keeps the demo login code. Adding these in Render → opflow-api → E
   values as in `backend/.env`.
 - **Cashfree sandbox:** `CASHFREE_ENV=sandbox`, `CASHFREE_CLIENT_ID`, `CASHFREE_CLIENT_SECRET`, and for doctor
   payouts `CASHFREE_PAYOUT_CLIENT_ID`, `CASHFREE_PAYOUT_CLIENT_SECRET`, `CASHFREE_PAYOUT_PUBLIC_KEY_B64`. Webhooks:
-  Payment Gateway → `https://opflow-backend.onrender.com/v1/webhooks/cashfree`; Payouts (V2) →
-  `https://opflow-backend.onrender.com/v1/webhooks/cashfree-payouts`.
+  Payment Gateway → `https://backend.opflow.in/v1/webhooks/cashfree`; Payouts (V2) →
+  `https://backend.opflow.in/v1/webhooks/cashfree-payouts`.
 
 ## Later: going live
 
